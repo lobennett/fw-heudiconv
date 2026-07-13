@@ -475,13 +475,13 @@ def parse_validator(path):
 
         parsed = parse_issue(warn)
         parsed = pd.DataFrame(parsed)
-        df = df.append(parsed, ignore_index=True)
+        df = pd.concat([df, parsed], ignore_index=True)
 
     for err in issues['errors']:
 
         parsed = parse_issue(err)
         parsed = pd.DataFrame(parsed)
-        df = df.append(parsed, ignore_index=True)
+        df = pd.concat([df, parsed], ignore_index=True)
 
     return df
 

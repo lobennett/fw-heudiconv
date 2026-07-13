@@ -47,7 +47,7 @@ def tabulate_bids(client, project_label, path=".", subject_labels=None,
 
     if unique:
         df = df.drop_duplicates(subset=['TR', 'TE', 'protocol_name', 'is_motion_corrected', 'is_derived', 'series_description'])
-        df = df.drop(['total_files_till_now', 'dcm_dir_name'], 1)
+        df = df.drop(columns=['total_files_till_now', 'dcm_dir_name'])
 
     return df
 
