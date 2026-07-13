@@ -15,6 +15,7 @@ SEQINFO_FIELDS = [
     'total_files_till_now',  # 0
     'example_dcm_file',      # 1
     'series_id',             # 2
+    'acquisition_label',     # (fork add) Flywheel acq.label — curated, unlike raw SeriesDescription
     'dcm_dir_name',          # 3
     'series_files',          # 4
     'unspecified',           # 5
@@ -87,6 +88,7 @@ def acquisition_to_heudiconv(client, acq, context):
             context['total'],
             zip_info.members[0].path if zip_info else None,
             acq.id,
+            acq.label,
             fileobj.name,
             '-',
             '-',
