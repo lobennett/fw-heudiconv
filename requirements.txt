@@ -1,4 +1,4 @@
-flywheel-sdk ~= 14.6.5
+flywheel-sdk==21.5.0
 pandas
 bids-validator
 validators

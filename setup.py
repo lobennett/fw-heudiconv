@@ -16,7 +16,7 @@ setuptools.setup(
     url="https://github.com/PennBBL/fw_heudiconv",
     packages=setuptools.find_packages(),
     install_requires=[
-        "flywheel-sdk~=14.6.5",
+        "flywheel-sdk==21.5.0",
         "pandas",
         "bids-validator",
         "validators",
@@ -24,7 +24,6 @@ setuptools.setup(
         "pytest",
         "pytest-cov",
         "nibabel",
-        "heudiconv"
     ],
     classifiers=[
         "Programming Language :: Python :: 3.6",

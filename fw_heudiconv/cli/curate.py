@@ -10,7 +10,7 @@ import requests
 from collections import defaultdict
 from fw_heudiconv.backend_funcs.convert import apply_heuristic, confirm_intentions, confirm_bids_namespace, verify_attachment, upload_attachment
 from fw_heudiconv.backend_funcs.query import get_seq_info
-from heudiconv import utils
+from fw_heudiconv._compat import load_heuristic
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +56,7 @@ def convert_to_bids(client, project_label, heuristic_path, subject_labels=None,
     try:
 
         if os.path.isfile(heuristic_path):
-            heuristic = utils.load_heuristic(heuristic_path)
+            heuristic = load_heuristic(heuristic_path)
 
         elif "github" in heuristic_path and validators.url(heuristic_path):
 
