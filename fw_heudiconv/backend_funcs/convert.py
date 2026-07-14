@@ -54,6 +54,66 @@ def force_label_format(str_input):
     return(str_input)
 
 
+def _echo_number(filename):
+    """Extract echo number from a Flywheel NIfTI name like ``*_e2.nii.gz``."""
+    m = re.search(r"_e(\d+)(?:\.|_)", filename)
+    return int(m.group(1)) if m else None
+
+
+def _is_nifti(f):
+    return f.name.endswith((".nii.gz", ".nii"))
+
+
+def _newest(candidates):
+    return max(candidates, key=lambda f: getattr(f, "created", "") or "")
+
+
+def _select_echo_files(files):
+    """Select raw multi-echo BOLD NIfTIs, indexed by true echo number.
+
+    Multi-echo acquisitions carry derivative NIfTIs (optimally-combined,
+    t2smap, sbref) with no ``_e<N>`` tag; those are dropped. When a gear emits
+    duplicate copies for the same echo, the most recently created wins (mirrors
+    the legacy bidsify ``file_selector`` that produced the canonical Oak tree).
+
+    Returns a list of ``(fileobj, echo_int)`` sorted by echo number.
+    """
+    by_echo = {}
+    for f in files:
+        if not _is_nifti(f):
+            continue
+        echo = _echo_number(f.name)
+        if echo is None:
+            continue
+        by_echo.setdefault(echo, []).append(f)
+    out = []
+    for echo in sorted(by_echo):
+        out.append((_newest(by_echo[echo]), echo))
+    return out
+
+
+def _select_files(files, template):
+    """Select + index the files a template applies to (mirrors legacy file_selector).
+
+    * ``{echo}`` template  -> raw multi-echo NIfTIs, indexed by echo number.
+    * ``_fieldmap`` suffix -> the single fieldmap NIfTI (``_fieldmap`` in name).
+    * ``_magnitude`` suffix -> the single magnitude NIfTI (the other one).
+    * anything else        -> all convertible files, upstream positional behaviour.
+
+    Returns ``[(fileobj, echo_or_None)]``.
+    """
+    if "{echo}" in template:
+        return _select_echo_files(files)
+    niftis = [f for f in files if _is_nifti(f)]
+    if template.endswith("_fieldmap"):
+        picks = [f for f in niftis if "_fieldmap" in f.name]
+        return [(_newest(picks), None)] if picks else []
+    if template.endswith("_magnitude"):
+        picks = [f for f in niftis if "_fieldmap" not in f.name]
+        return [(_newest(picks), None)] if picks else []
+    return [(f, None) for f in files]
+
+
 def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[],
                     metadata_extras={}, subj_replace=None, ses_replace=None, item_num=1):
     """ Apply heuristic to rename files
@@ -84,8 +144,16 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
     bids_keys = ['sub', 'ses', 'folder', 'name']
 
     files.sort(key=operator.itemgetter("name"))
-    for fnum, f in enumerate(files):
-        bids_vals = template.format(subject=subj_label, session=sess_label, item=fnum+1, seqitem=item_num).split("/")
+
+    # Select + index the files this template applies to (echo entities,
+    # fieldmap/magnitude split, or upstream positional default).
+    selected = _select_files(files, template)
+
+    for fnum, (f, echo) in enumerate(selected):
+        fmt = dict(subject=subj_label, session=sess_label, item=fnum + 1, seqitem=item_num)
+        if echo is not None:
+            fmt["echo"] = echo
+        bids_vals = template.format(**fmt).split("/")
         bids_dict = dict(zip(bids_keys, bids_vals))
         suffix = suffixes[f.type]
 
