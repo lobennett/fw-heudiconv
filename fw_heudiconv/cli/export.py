@@ -203,7 +203,7 @@ def download_bids(
     else:
         logger.info("Downloading files...")
     root_path = "/".join([root_path, name])
-    Path(root_path).mkdir()
+    Path(root_path).mkdir(parents=True, exist_ok=True)
 
     # handle dataset description
     if to_download['dataset_description']:
