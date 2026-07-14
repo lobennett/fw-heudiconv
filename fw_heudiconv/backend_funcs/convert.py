@@ -111,7 +111,14 @@ def _select_files(files, template):
     if template.endswith("_magnitude"):
         picks = [f for f in niftis if "_fieldmap" not in f.name]
         return [(_newest(picks), None)] if picks else []
-    return [(f, None) for f in files]
+    # Default: one scan per acquisition. Duplicate gear-output NIfTIs (same scan
+    # re-derived) collapse to the most recently created — mirrors the legacy
+    # bidsify _resolve_duplicate_file and prevents two files sharing one BIDS
+    # path (fw-heudiconv-export aborts on colliding paths). Non-NIfTI sidecars
+    # (bval/bvec/tsv) are kept as-is so dwi triples stay intact.
+    others = [f for f in files if not _is_nifti(f)]
+    picks = ([_newest(niftis)] if niftis else []) + others
+    return [(f, None) for f in picks]
 
 
 def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[],
