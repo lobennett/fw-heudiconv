@@ -38,6 +38,30 @@ def get_nested(dct, *keys):
     return dct
 
 
+def normalize_timing_units(d):
+    """Coerce DICOM-native millisecond timing fields to BIDS seconds, in place.
+
+    Flywheel file ``info`` sometimes carries ``RepetitionTime``/``EchoTime`` in
+    the DICOM-native millisecond unit (tags 0018,0080 / 0018,0081) rather than
+    the BIDS-required seconds, and inconsistently across acquisitions in the same
+    project. fw-heudiconv copies ``info`` verbatim into the sidecar, so the ms
+    values leak through, fail the validator (REPETITION_TIME_MISMATCH vs the
+    NIfTI header), and corrupt any downstream tool that reads TR/TE from the JSON.
+
+    No fMRI ``RepetitionTime`` exceeds 100 s and no ``EchoTime`` exceeds 1 s, so a
+    value above those bounds is unambiguously milliseconds -> divide by 1000.
+    ``SliceTiming`` is already emitted in seconds by the converter and is left
+    untouched. Only numeric values are touched; anything else passes through.
+    """
+    rt = d.get('RepetitionTime')
+    if isinstance(rt, (int, float)) and not isinstance(rt, bool) and rt > 100:
+        d['RepetitionTime'] = rt / 1000.0
+    te = d.get('EchoTime')
+    if isinstance(te, (int, float)) and not isinstance(te, bool) and te > 1:
+        d['EchoTime'] = te / 1000.0
+    return d
+
+
 def download_sidecar(d, fpath, remove_bids=True):
 
     if remove_bids and 'BIDS' in d:
@@ -45,6 +69,8 @@ def download_sidecar(d, fpath, remove_bids=True):
             if d['BIDS']['Task'] != "":
                 d['TaskName'] = d['BIDS']['Task']
         del d['BIDS']
+
+    normalize_timing_units(d)
 
     with open(fpath, 'w') as sidecar:
         json.dump(d, fp=sidecar, sort_keys=True, indent=4)
