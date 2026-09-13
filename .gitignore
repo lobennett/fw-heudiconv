@@ -108,3 +108,6 @@ venv.bak/
 grmpy_heuristic.py
 fw-heudiconv-*
 sandbox
+
+# Local synthetic audit fixtures and scratch dependency environments
+.audit/
