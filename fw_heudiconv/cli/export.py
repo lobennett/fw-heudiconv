@@ -1,4 +1,8 @@
 import flywheel
+import copy
+import tempfile
+import nibabel as nib
+import numpy as np
 import argparse
 import os
 import logging
@@ -10,6 +14,7 @@ import csv
 import pandas as pd
 from pathlib import Path
 from fw_heudiconv.backend_funcs.query import print_directory_tree
+from fw_heudiconv.backend_funcs.dwi import split_image_name, validate_dwi_sources
 
 
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +68,7 @@ def normalize_timing_units(d):
 
 
 def download_sidecar(d, fpath, remove_bids=True):
+    d = copy.deepcopy(d)
 
     if remove_bids and 'BIDS' in d:
         if 'Task' in d['BIDS']:
@@ -208,6 +214,7 @@ def gather_bids(client, project_label, subject_labels=None, session_labels=None)
             'name': af.name,
             'type': af.type,
             'data': af.parent.id,
+            'origin': get_nested(af, 'origin'),
             'BIDS': get_nested(af, 'info', 'BIDS'),
             'sidecar': get_nested(af, 'info')
         }
@@ -218,155 +225,168 @@ def gather_bids(client, project_label, subject_labels=None, session_labels=None)
     return to_download
 
 
+def _export_entries(to_download, root, folders, attachments):
+    """Resolve every payload and generated sidecar before touching the output tree."""
+    entries = []
+
+    def add(relative, kind, data, source, preserve_existing=False):
+        relative = Path(relative)
+        destination = (root / relative).resolve()
+        if relative.is_absolute() or root not in destination.parents:
+            raise ValueError('BIDS destination escapes output root: {} ({})'.format(
+                relative, source))
+        entries.append(dict(path=destination, kind=kind, data=data, source=source,
+                            preserve_existing=preserve_existing))
+
+    if to_download['dataset_description']:
+        description = to_download['dataset_description'][0]
+        add(description['name'], 'json', description['data'], 'dataset description', True)
+    if not any(f['name'] == '.bidsignore' for f in to_download['project']):
+        add('.bidsignore', 'text', 'perf/\nqsm/\n**/fmap/*.bvec\n**/fmap/*.bval',
+            'default BIDS ignore', True)
+
+    for level in ('project', 'subject', 'session', 'acquisition'):
+        for fi in to_download[level]:
+            if level == 'subject' and attachments and fi['name'] not in attachments:
+                continue
+            if (level == 'session' and attachments
+                    and not any(re.search(pattern, fi['name']) for pattern in attachments)):
+                continue
+            bids = fi.get('BIDS')
+            if not isinstance(bids, dict) or bids.get('ignore'):
+                continue
+            path = bids.get('Path')
+            if level == 'acquisition':
+                if not path or bids.get('Folder') not in folders:
+                    continue
+                filename = bids.get('Filename')
+                if not filename:
+                    continue
+            else:
+                if path is None:
+                    continue
+                filename = fi['name']
+            source = '{} {}:{}'.format(level, fi['data'], fi['name'])
+            relative = Path(path) / filename
+            add(relative, 'file', fi, source)
+            if level == 'acquisition' and 'sidecar' in fi and fi['type'] == 'nifti':
+                stem, extension = split_image_name(filename)
+                if extension not in ('.nii', '.nii.gz'):
+                    raise ValueError('Invalid NIfTI destination: ' + source)
+                add(Path(path) / (stem + '.json'), 'sidecar', fi['sidecar'], source + ' JSON')
+    return entries
+
+
+def _preflight_destinations(entries):
+    owners = {}
+    for entry in entries:
+        destination = entry['path']
+        if destination in owners:
+            raise FileExistsError('Conflicting BIDS destination {}: {} and {}'.format(
+                destination, owners[destination], entry['source']))
+        owners[destination] = entry['source']
+        if destination.exists() or destination.is_symlink():
+            if not (entry['preserve_existing'] and destination.is_file()):
+                raise FileExistsError('BIDS destination already exists: {} ({})'.format(
+                    destination, entry['source']))
+    for destination, source in owners.items():
+        for parent in destination.parents:
+            if parent in owners or (parent.exists() and not parent.is_dir()):
+                raise FileExistsError('Conflicting BIDS directory {} for {} ({})'.format(
+                    parent, destination, source))
+
+
+def _dwi_export_sets(entries):
+    groups = {}
+    for entry in entries:
+        if entry['kind'] != 'file':
+            continue
+        stem, extension = split_image_name(entry['path'].name)
+        if stem.endswith('_dwi') and extension:
+            groups.setdefault(entry['path'].with_name(stem), []).append(entry)
+    for destination, group in groups.items():
+        sources = [entry['data'] for entry in group]
+        if len({f['data'] for f in sources}) != 1:
+            raise ValueError('Ambiguous DWI pairing at {}: different acquisitions: {}'.format(
+                destination, ', '.join(entry['source'] for entry in group)))
+        try:
+            validate_dwi_sources(sources)
+        except ValueError as exc:
+            raise ValueError('{} at destination {}'.format(exc, destination)) from exc
+    return groups.values()
+
+
+def _validate_dwi_gradients(group, staged):
+    """Validate counts/shape only after source identity has established pairing."""
+    paths = {}
+    for entry in group:
+        extension = split_image_name(entry['path'].name)[1]
+        paths['nifti' if extension in ('.nii', '.nii.gz') else extension] = staged[entry['path']]
+    evidence = ', '.join(entry['source'] for entry in group)
+    try:
+        shape = nib.load(str(paths['nifti'])).shape
+        if len(shape) not in (3, 4) or any(n < 1 for n in shape):
+            raise ValueError('expected a nonempty 3D or 4D DWI image, got {}'.format(shape))
+        volumes = shape[3] if len(shape) == 4 else 1
+        bvals = np.loadtxt(paths['.bval'], ndmin=2)
+        bvecs = np.loadtxt(paths['.bvec'], ndmin=2)
+        if bvals.shape != (1, volumes) or bvecs.shape != (3, volumes):
+            raise ValueError('image has {} volumes; bval shape {}, bvec shape {}; '
+                             'expected (1, N) and (3, N)'.format(
+                                 volumes, bvals.shape, bvecs.shape))
+        if not np.isfinite(bvals).all() or not np.isfinite(bvecs).all():
+            raise ValueError('nonfinite bval or bvec values')
+    except (ValueError, OSError, nib.filebasedimages.ImageFileError) as exc:
+        raise ValueError('Invalid DWI gradients for {}: {}'.format(evidence, exc)) from exc
+
+
 def download_bids(
     client, to_download, root_path,
     folders_to_download=['anat', 'dwi', 'func', 'fmap', 'perf'],
     attachments=None, dry_run=True, name='bids_dataset'
         ):
-
+    root = Path(root_path, name).resolve()
+    entries = _export_entries(to_download, root, folders_to_download, attachments)
+    _preflight_destinations(entries)
+    dwi_sets = list(_dwi_export_sets(entries))
+    # Existing study-level metadata belongs to the study; defaults initialize it
+    # only when absent. All payload/sidecar collisions above are errors.
+    pending = [entry for entry in entries
+               if not (entry['preserve_existing'] and entry['path'].exists())]
     if dry_run:
-        logger.info("Preparing output directory tree...")
+        logger.info('Preparing output directory tree (gradient contents are not checked)...')
+        for entry in pending:
+            entry['path'].parent.mkdir(parents=True, exist_ok=True)
+            entry['path'].touch(exist_ok=False)
     else:
-        logger.info("Downloading files...")
-    root_path = "/".join([root_path, name])
-    Path(root_path).mkdir(parents=True, exist_ok=True)
-
-    # handle dataset description
-    if to_download['dataset_description']:
-        description = to_download['dataset_description'][0]
-
-        path = "/".join([root_path, description['name']])
-
-        if dry_run:
-            Path(path).touch()
-        else:
-            download_sidecar(description['data'], path, remove_bids=False)
-
-    # write bids ignore
-    if not any(x['name'] == '.bidsignore' for x in to_download['project']):
-        # write bids ignore
-        path = "/".join([root_path, ".bidsignore"])
-        ignored_modalities = ['perf/', 'qsm/', '**/fmap/*.bvec', '**/fmap/*.bval']
-        if dry_run:
-            Path(path).touch()
-        else:
-            with open(path, 'w') as bidsignore:
-                bidsignore.writelines('\n'.join(ignored_modalities))
-
-    # deal with project level files
-    # Project's subject data
-    for fi in to_download['project']:
-
-        if fi['BIDS'] is not None and get_nested(fi, 'BIDS', 'Path') is not None:
-            output_path = get_nested(fi, 'BIDS', 'Path')
-            path = str(Path(output_path, fi['name']))
-
-            if not Path(output_path).exists():
-                os.makedirs(Path(output_path).resolve(), exist_ok=True)
-
-            if dry_run:
-                Path(path).touch()
-            else:
-                container = client.get(fi['data'])
-                container.download_file(fi['name'], path)
-
-    # deal with subject level files
-    for fi in to_download['subject']:
-
-        if attachments:
-
-            if fi['name'] not in attachments:
-                continue
-
-        if fi['BIDS'] is not None and get_nested(fi, 'BIDS', 'Path') is not None:
-
-            output_path = get_nested(fi, 'BIDS', 'Path')
-            path = str(Path(output_path, fi['name']))
-
-            if not Path(output_path).exists():
-                os.makedirs(Path(output_path).resolve(), exist_ok=True)
-
-            if dry_run:
-                Path(path).touch()
-            else:
-                container = client.get(fi['data'])
-                container.download_file(fi['name'], path)
-
-    for fi in to_download['session']:
-        if attachments:
-
-            if not any([re.search(att, fi['name']) for att in attachments]):
-                continue
-
-        if fi['BIDS'] is not None and get_nested(fi, 'BIDS', 'Path') is not None:
-            output_path = Path(root_path, get_nested(fi, 'BIDS', 'Path'))
-            path = str(Path(output_path, fi['name']))
-
-            if not Path(output_path).exists():
-                os.makedirs(Path(output_path).resolve(), exist_ok=True)
-
-            if dry_run:
-                Path(path).touch()
-            else:
-                container = client.get(fi['data'])
-                container.download_file(fi['name'], path)
-
-    # deal with acquisition level files
-    for fi in to_download['acquisition']:
-        project_path = get_nested(fi, 'BIDS', 'Path')
-        folder = get_nested(fi, 'BIDS', 'Folder')
-        ignore = get_nested(fi, 'BIDS', 'ignore')
-        if project_path and folder in folders_to_download and not ignore:
-
-            # only download files with sidecars
-            if 'sidecar' in fi:
-                fname = get_nested(fi, 'BIDS', 'Filename')
-                extensions = ['nii.gz', 'bval', 'bvec']
-                sidecar_name = fname
-                for x in extensions:
-                    sidecar_name = sidecar_name.replace(x, 'json')
-
-                download_path = '/'.join([root_path, project_path])
-                file_path = '/'.join([download_path, fname])
-                if Path(file_path).exists():
-                    logger.error("Found conflicting file paths:")
-                    logger.error(file_path)
-                    logger.error("Cleaning up...")
-                    shutil.rmtree(root_path)
-                    raise FileExistsError
-
-                sidecar_path = '/'.join([download_path, sidecar_name])
-                acq = client.get(fi['data'])
-
-                if not os.path.exists(download_path):
-                    os.makedirs(download_path)
-
-                if dry_run:
-                    Path(file_path).touch()
-                    Path(sidecar_path).touch()
+        logger.info('Downloading files...')
+        # Stage under the chosen destination parent. Failed downloads or invalid
+        # DWI contents cannot overwrite prior output or leave a mixed source set.
+        root.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.fw-heudiconv-', dir=root.parent) as scratch:
+            staged = {}
+            for entry in pending:
+                target = Path(scratch) / entry['path'].relative_to(root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                kind, data = entry['kind'], entry['data']
+                if kind == 'file':
+                    client.get(data['data']).download_file(data['name'], str(target))
+                elif kind in ('json', 'sidecar'):
+                    download_sidecar(data, str(target), remove_bids=(kind == 'sidecar'))
                 else:
-                    acq.download_file(fi['name'], file_path)
-                    download_sidecar(fi['sidecar'], sidecar_path, remove_bids=True)
-
-            #exception: it may be an events tsv
-            elif any(x in fi['name'] for x in ['bval', 'bvec', 'tsv']):
-                fname = get_nested(fi, 'BIDS', 'Filename')
-                download_path = '/'.join([root_path, project_path])
-                file_path = '/'.join([download_path, fname])
-                acq = client.get(fi['data'])
-
-                if not os.path.exists(download_path):
-                    os.makedirs(download_path)
-
-                if dry_run:
-                    Path(file_path).touch()
-                    Path(sidecar_path).touch()
-                else:
-                    acq.download_file(fi['name'], file_path)
-    #check_tasks(root_path)
-
-    logger.info("Done!")
-    print_directory_tree(root_path)
+                    target.write_text(data)
+                staged[entry['path']] = target
+            for group in dwi_sets:
+                _validate_dwi_gradients(group, staged)
+            # Recheck after downloads, then publish without overwriting even if
+            # another exporter races us. This is not a multi-file transaction.
+            _preflight_destinations(entries)
+            for destination, source in staged.items():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with destination.open('xb') as output, source.open('rb') as downloaded:
+                    shutil.copyfileobj(downloaded, output)
+    logger.info('Done!')
+    print_directory_tree(str(root))
 
 
 def get_parser():

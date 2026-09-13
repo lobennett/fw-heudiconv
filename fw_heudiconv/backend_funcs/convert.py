@@ -1,4 +1,5 @@
 import logging
+import copy
 import re
 import pdb
 import operator
@@ -11,6 +12,7 @@ from os import path
 from pathvalidate import is_valid_filename
 from pathlib import Path
 from fw_heudiconv.cli.export import get_nested
+from fw_heudiconv.backend_funcs.dwi import select_dwi_files, split_image_name
 
 logger = logging.getLogger('fw-heudiconv-curator')
 
@@ -65,7 +67,7 @@ def _is_nifti(f):
 
 
 def _newest(candidates):
-    return max(candidates, key=lambda f: getattr(f, "created", "") or "")
+    return max(candidates, key=lambda f: (getattr(f, "created", "") or "", f.name))
 
 
 def _select_echo_files(files):
@@ -98,12 +100,15 @@ def _select_files(files, template):
     * ``{echo}`` template  -> raw multi-echo NIfTIs, indexed by echo number.
     * ``_fieldmap`` suffix -> the single fieldmap NIfTI (``_fieldmap`` in name).
     * ``_magnitude`` suffix -> the single magnitude NIfTI (the other one).
-    * anything else        -> all convertible files, upstream positional behaviour.
+    * ``_dwi`` suffix      -> newest image and its coherent bval/bvec source set.
+    * anything else        -> newest NIfTI only.
 
     Returns ``[(fileobj, echo_or_None)]``.
     """
     if "{echo}" in template:
         return _select_echo_files(files)
+    if template.endswith("_dwi"):
+        return [(f, None) for f in select_dwi_files(files)]
     niftis = [f for f in files if _is_nifti(f)]
     if template.endswith("_fieldmap"):
         picks = [f for f in niftis if "_fieldmap" in f.name]
@@ -118,9 +123,15 @@ def _select_files(files, template):
     # belong ONLY to dwi; attaching them to anat produces invalid names like
     # ``_T1w.bval``, so keep them solely for the ``_dwi`` suffix.
     picks = [_newest(niftis)] if niftis else []
-    if template.endswith("_dwi"):
-        picks += [f for f in files if not _is_nifti(f)]
     return [(f, None) for f in picks]
+
+
+def _bids_destination(bids):
+    """Treat compressed/uncompressed copies as one image destination."""
+    filename = bids.get('Filename') or ''
+    if filename.endswith('.nii.gz'):
+        filename = filename[:-3]
+    return bids.get('Path'), filename
 
 
 def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[],
@@ -158,33 +169,39 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
     # fieldmap/magnitude split, or upstream positional default).
     selected = _select_files(files, template)
 
+    updates = []
     for fnum, (f, echo) in enumerate(selected):
-        fmt = dict(subject=subj_label, session=sess_label, item=fnum + 1, seqitem=item_num)
+        # The three DWI members describe one image, including in {item} templates.
+        item = 1 if template.endswith('_dwi') else fnum + 1
+        fmt = dict(subject=subj_label, session=sess_label, item=item, seqitem=item_num)
         if echo is not None:
             fmt["echo"] = echo
         bids_vals = template.format(**fmt).split("/")
         bids_dict = dict(zip(bids_keys, bids_vals))
         suffix = suffixes[f.type]
+        if _is_nifti(f):
+            suffix = split_image_name(f.name)[1]
 
-        if 'BIDS' not in f.info:
-            f.info['BIDS'] = ""
-        new_bids = f.info['BIDS']
-        if new_bids in ("NA", ""):
+        new_bids = copy.deepcopy(f.info.get('BIDS'))
+        if new_bids in (None, "NA", ""):
             new_bids = add_empty_bids_fields(bids_dict['folder'], bids_dict['name'])
         new_bids['Filename'] = bids_dict['name']+suffix
         new_bids['Folder'] = bids_dict['folder']
         new_bids['Path'] = "/".join([bids_dict['sub'],
                                      bids_dict['ses'],
                                      bids_dict['folder']])
-        new_bids['error_message'] = ""
-        new_bids['valid'] = True
+        if not new_bids.get('ignore'):
+            new_bids['error_message'] = ""
+            new_bids['valid'] = True
 
         infer_params_from_filename(new_bids)
 
         destination = "\n" + f.name + "\n\t" + new_bids['Filename'] + " -> " \
             + new_bids["Path"] + "/" + new_bids['Filename']
         logger.debug(destination)
+        updates.append((f, new_bids))
 
+    for f, new_bids in updates:
         if not dry_run:
             acquisition_object.update_file_info(f.name, {'BIDS': new_bids})
             acquisition_object = client.get(acquisition_id) # Refresh the acquisition object
@@ -213,6 +230,24 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
                 new_metadata = old_metadata.copy()
                 new_metadata.update(metadata_extras)
                 acquisition_object.update_file_info(f.name, new_metadata)
+
+    # Only retire after replacement updates succeed. Older fork versions left
+    # these destinations active on superseded copies.
+    # Match the exact destination within this acquisition: unrelated templates
+    # and study QA fields are not ours to clear. Do not use ignore for retirement;
+    # that field belongs to study QA and must never be unset when reselected.
+    destinations = {_bids_destination(b) for _, b in updates}
+    selected_names = {f.name for f, _ in updates}
+    for f in files:
+        bids = f.info.get('BIDS')
+        if (f.name in selected_names or not isinstance(bids, dict)
+                or _bids_destination(bids) not in destinations):
+            continue
+        retired = copy.deepcopy(bids)
+        retired.update(Path='', Filename='', valid=False)
+        logger.debug('Retiring superseded destination on %s: %s', f.name, bids['Filename'])
+        if not dry_run:
+            acquisition_object.update_file_info(f.name, {'BIDS': retired})
 
 
 def add_empty_bids_fields(folder, fname=None):
