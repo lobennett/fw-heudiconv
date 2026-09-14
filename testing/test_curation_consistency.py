@@ -4,7 +4,9 @@ import copy
 import nibabel as nib
 import pytest
 
-from testing.synthetic_flywheel import Client, curate, export, source_file, template
+from testing.synthetic_flywheel import (
+    Client, curate, dwi_set, export, source_file, template,
+)
 
 
 @pytest.mark.parametrize('folder,suffix,source', [
@@ -168,3 +170,70 @@ def infotodict(seqinfos):
     image, = (tmp_path / 'out').rglob('*.nii.gz')
     assert image.name == 'sub-renamed_ses-02_task-rest_run-1_echo-2_bold.nii.gz'
     assert nib.load(image).get_fdata().mean() == 20
+
+
+@pytest.mark.parametrize('folder,suffix,source', [
+    ('anat', 'T1w', 'scan'),
+    ('func', 'task-rest_echo-{echo}_bold', 'scan_e2'),
+    ('fmap', 'fieldmap', 'scan_fieldmap'),
+])
+def test_qa_rejected_newer_copy_never_displaces_the_valid_one(tmp_path, folder, suffix, source):
+    valid = source_file(tmp_path, 'old_' + source + '.nii.gz', 10, '2026-01-01')
+    client = Client([valid])
+    tmpl = template(folder, suffix)
+    curate(client, tmpl)
+    rejected = source_file(tmp_path, 'new_' + source + '.nii.gz', 99, '2026-02-01')
+    rejected.info['BIDS'] = {'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    rejected_before = copy.deepcopy(rejected.info)
+    client.acq.files.append(rejected)
+
+    curate(client, tmpl)
+
+    assert valid.info['BIDS']['Path'] == 'sub-01/ses-01/' + folder
+    assert valid.info['BIDS']['valid'] is True
+    assert rejected.info == rejected_before
+    export(client, tmp_path / 'out')
+    images = list((tmp_path / 'out').rglob('*.nii.gz'))
+    assert len(images) == 1
+    assert nib.load(images[0]).get_fdata().mean() == 10
+
+
+def test_qa_rejected_dwi_set_never_displaces_the_valid_one(tmp_path):
+    valid = dwi_set(tmp_path / 'valid', 'scan', 10, '2026-01-01')
+    client = Client(list(valid))
+    tmpl = template('dwi', 'dwi')
+    curate(client, tmpl)
+    rejected = dwi_set(tmp_path / 'rejected', 'rescan', 99, '2026-02-01')
+    for f in rejected:
+        f.info['BIDS'] = {'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    rejected_before = copy.deepcopy([f.info for f in rejected])
+    client.acq.files.extend(rejected)
+
+    curate(client, tmpl)
+
+    assert all(f.info['BIDS']['Path'] == 'sub-01/ses-01/dwi' for f in valid)
+    assert [f.info for f in rejected] == rejected_before
+    export(client, tmp_path / 'out')
+    images = list((tmp_path / 'out').rglob('*.nii.gz'))
+    assert len(images) == 1
+    assert nib.load(images[0]).get_fdata().mean() == 10
+
+
+def test_acquisition_with_only_rejected_candidates_is_omitted_untouched(tmp_path):
+    rejected = source_file(tmp_path, 'scan.nii.gz', 10, '2026-01-01')
+    rejected.info['BIDS'] = {'Path': 'sub-01/ses-01/anat', 'Folder': 'anat',
+                             'Filename': 'sub-01_ses-01_T1w.nii.gz',
+                             'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    other = source_file(tmp_path, 'rescan.nii.gz', 99, '2026-02-01')
+    other.info['BIDS'] = {'Path': 'sub-01/ses-01/anat', 'Folder': 'anat',
+                          'Filename': 'sub-01_ses-01_T2w.nii.gz',
+                          'ignore': True, 'valid': True, 'error_message': ''}
+    client = Client([rejected, other])
+    before = copy.deepcopy([f.info for f in client.acq.files])
+
+    curate(client, template('anat', 'T1w'))
+
+    assert [f.info for f in client.acq.files] == before
+    assert client.acq.calls == []
+    export(client, tmp_path / 'out')
+    assert not list((tmp_path / 'out').rglob('*.nii.gz'))

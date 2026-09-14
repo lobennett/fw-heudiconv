@@ -66,6 +66,12 @@ def _is_nifti(f):
     return f.name.endswith((".nii.gz", ".nii"))
 
 
+def _is_qa_ignored(f):
+    """True when study QA rejected this file, making it unselectable."""
+    bids = (getattr(f, 'info', None) or {}).get('BIDS')
+    return isinstance(bids, dict) and bool(bids.get('ignore'))
+
+
 def _newest(candidates):
     return max(candidates, key=lambda f: (getattr(f, "created", "") or "", f.name))
 
@@ -193,10 +199,19 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
 
     files.sort(key=operator.itemgetter("name"))
 
+    # A QA-rejected copy is never curated, so it can neither win selection nor
+    # take a destination away from a valid copy. An acquisition whose candidates
+    # are all rejected is omitted; nothing else in it is touched.
+    candidates = [f for f in files if not _is_qa_ignored(f)]
+    if files and not candidates:
+        logger.debug('Acquisition %s: every candidate is QA-ignored, nothing to curate',
+                     acquisition_id)
+        return
+
     # Select + index the files this template applies to (echo entities,
     # fieldmap/magnitude split, or upstream positional default).
     try:
-        selected = _select_files(files, template)
+        selected = _select_files(candidates, template)
         if not selected:
             raise ValueError('No valid files selected; inspect converter outputs '
                              'and the mapped template. Candidates: '
@@ -226,9 +241,8 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
         new_bids['Path'] = "/".join([bids_dict['sub'],
                                      bids_dict['ses'],
                                      bids_dict['folder']])
-        if not new_bids.get('ignore'):
-            new_bids['error_message'] = ""
-            new_bids['valid'] = True
+        new_bids['error_message'] = ""
+        new_bids['valid'] = True
 
         infer_params_from_filename(new_bids)
 

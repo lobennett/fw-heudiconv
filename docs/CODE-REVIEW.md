@@ -44,7 +44,12 @@ tag invalid) on superseded files in the same acquisition with the same rendered
 destination. Compressed and uncompressed NIfTI copies share this identity.
 Other destinations/templates and metadata survive. Retirement does not use
 `BIDS.ignore`; QA rejection, its error text and custom QA fields are retained.
-Selected rejected files stay rejected. Copies of metadata also keep dry curation
+A QA-rejected file is not a selection candidate for ordinary, echo or DWI
+templates, so a rejected newer conversion can neither become the curated copy
+nor retire a valid older one, and curation never writes to it. When every
+candidate in an acquisition is rejected, the acquisition is omitted with no
+update at all, rather than raising the unmapped-acquisition error.
+Copies of metadata also keep dry curation
 from mutating objects returned by the SDK. Non-DWI timestamp ties use filenames
 as a stable tie-breaker; newest selection remains unchanged for unequal times.
 
@@ -214,8 +219,9 @@ and a full query → heuristic → curation → export path.
   consumer wrapper that deletes its output before calling the helper bypasses
   that protection. The Network wrapper's pre-call deletion was identified for
   separate integration work; this fork does not change or validate that wrapper.
-- A partially QA-ignored DWI set is refused as incomplete; an entirely ignored
-  set is omitted. QA flags are never cleared to make a set exportable.
+- A partially QA-ignored DWI set is refused as incomplete at both curation and
+  export; an entirely ignored set is omitted. QA flags are never cleared to make
+  a set exportable.
 - Dry export keeps the existing placeholder-tree behavior and performs metadata
   and path checks, but cannot validate gradient contents without downloading.
 - Staging requires local disk space for the dataset, but not a second copy of
