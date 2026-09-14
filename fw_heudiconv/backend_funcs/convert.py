@@ -58,7 +58,7 @@ def force_label_format(str_input):
 
 def _echo_number(filename):
     """Extract echo number from a Flywheel NIfTI name like ``*_e2.nii.gz``."""
-    m = re.search(r"_e(\d+)(?:\.|_)", filename)
+    m = re.search(r"_e(\d+)$", split_image_name(filename)[0])
     return int(m.group(1)) if m else None
 
 
@@ -68,6 +68,36 @@ def _is_nifti(f):
 
 def _newest(candidates):
     return max(candidates, key=lambda f: (getattr(f, "created", "") or "", f.name))
+
+
+def _image_component(f):
+    """Read supported converter component markers, retaining contradictions."""
+    stem = split_image_name(f.name)[0]
+    info = getattr(f, 'info', None) or {}
+    image_type = info.get('ImageType', [])
+    tokens = set(image_type) if isinstance(image_type, (list, tuple)) else set()
+    component = info.get('ComplexImageComponent')
+    phase = stem.endswith('_ph') or 'P' in tokens or component == 'PHASE'
+    magnitude = 'M' in tokens or component == 'MAGNITUDE'
+    if phase and magnitude:
+        return 'conflicting'
+    if phase:
+        return 'phase'
+    if (stem.endswith(('_real', '_imaginary', '_phMag'))
+            or component in ('REAL', 'IMAGINARY')):
+        return 'other'
+    return 'magnitude' if magnitude else None
+
+
+def _is_fieldmap(f):
+    """Keep the legacy marker; phase-named maps require converter Hz evidence."""
+    if '_fieldmap' in split_image_name(f.name)[0]:
+        return True
+    info = getattr(f, 'info', None) or {}
+    component = _image_component(f)
+    if component in ('magnitude', 'conflicting', 'other'):
+        return False
+    return info.get('Units') == 'Hz'
 
 
 def _select_echo_files(files):
@@ -82,7 +112,7 @@ def _select_echo_files(files):
     """
     by_echo = {}
     for f in files:
-        if not _is_nifti(f):
+        if not _is_nifti(f) or _image_component(f) in ('phase', 'conflicting', 'other'):
             continue
         echo = _echo_number(f.name)
         if echo is None:
@@ -98,8 +128,8 @@ def _select_files(files, template):
     """Select + index the files a template applies to (mirrors legacy file_selector).
 
     * ``{echo}`` template  -> raw multi-echo NIfTIs, indexed by echo number.
-    * ``_fieldmap`` suffix -> the single fieldmap NIfTI (``_fieldmap`` in name).
-    * ``_magnitude`` suffix -> the single magnitude NIfTI (the other one).
+    * ``_fieldmap`` suffix -> a converter-marked fieldmap or an explicit Hz map.
+    * ``_magnitude`` suffix -> the magnitude NIfTI, excluding phase/components.
     * ``_dwi`` suffix      -> newest image and its coherent bval/bvec source set.
     * anything else        -> newest NIfTI only.
 
@@ -111,10 +141,11 @@ def _select_files(files, template):
         return [(f, None) for f in select_dwi_files(files)]
     niftis = [f for f in files if _is_nifti(f)]
     if template.endswith("_fieldmap"):
-        picks = [f for f in niftis if "_fieldmap" in f.name]
+        picks = [f for f in niftis if _is_fieldmap(f)]
         return [(_newest(picks), None)] if picks else []
     if template.endswith("_magnitude"):
-        picks = [f for f in niftis if "_fieldmap" not in f.name]
+        picks = [f for f in niftis if not _is_fieldmap(f)
+                 and _image_component(f) in (None, 'magnitude')]
         return [(_newest(picks), None)] if picks else []
     # Default: one scan per acquisition. Duplicate gear-output NIfTIs (same scan
     # re-derived) collapse to the most recently created — mirrors the legacy
@@ -167,7 +198,15 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
 
     # Select + index the files this template applies to (echo entities,
     # fieldmap/magnitude split, or upstream positional default).
-    selected = _select_files(files, template)
+    try:
+        selected = _select_files(files, template)
+        if not selected:
+            raise ValueError('No valid files selected; inspect converter outputs '
+                             'and the mapped template. Candidates: '
+                             + ', '.join(f.name for f in files))
+    except ValueError as exc:
+        raise ValueError('Acquisition {} ({}), template {}: {}'.format(
+            acquisition_id, getattr(acquisition_object, 'label', ''), template, exc)) from exc
 
     updates = []
     for fnum, (f, echo) in enumerate(selected):
