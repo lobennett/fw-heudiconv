@@ -218,7 +218,10 @@ and a full query → heuristic → curation → export path.
   set is omitted. QA flags are never cleared to make a set exportable.
 - Dry export keeps the existing placeholder-tree behavior and performs metadata
   and path checks, but cannot validate gradient contents without downloading.
-- Staging requires additional local disk space. Publication is not a multi-file
+- Staging requires local disk space for the dataset, but not a second copy of
+  it: the staging tree shares the output parent's filesystem, so publication
+  hardlinks each staged file into the root and only copies where the filesystem
+  refuses hardlinks. Publication is not a multi-file
   transaction: an I/O failure or concurrent writer during publication may leave
   some new files. Exclusive creation protects prior files, and retries report
   those conflicts. No broad transaction/state framework was introduced.

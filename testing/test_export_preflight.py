@@ -1,11 +1,14 @@
 """A conflict must be diagnosed before downloading or changing prior output."""
 import copy
+import errno
+import os
+from pathlib import Path
 
 import pytest
 
 from fw_heudiconv.cli.export import download_bids, gather_bids
 from testing.synthetic_flywheel import (
-    Client, curate, dwi_set, export, source_file, template, tree_bytes,
+    Acquisition, Client, curate, dwi_set, export, source_file, template, tree_bytes,
 )
 
 
@@ -117,3 +120,68 @@ def test_dry_run_creates_gradient_paths_without_downloading(tmp_path):
     assert len(list((tmp_path / 'out').rglob('*.bval'))) == 1
     assert len(list((tmp_path / 'out').rglob('*.bvec'))) == 1
     assert client.acq.downloads == []
+
+
+def anat_client(tmp_path):
+    client = Client([source_file(tmp_path / 'sources', 'scan.nii.gz')])
+    curate(client, template('anat', 'T1w'))
+    return client
+
+
+def test_publication_does_not_reread_the_staged_payload(tmp_path, monkeypatch):
+    """Publishing a staged file must not cost a second full read+write of it."""
+    if getattr(os, 'geteuid', lambda: 1)() == 0:
+        pytest.skip('running as root bypasses the unreadable-source check')
+    client = anat_client(tmp_path)
+    real_download = Acquisition.download_file
+
+    def download_then_seal(self, name, dest, **kwargs):
+        real_download(self, name, dest, **kwargs)
+        os.chmod(dest, 0)
+
+    monkeypatch.setattr(Acquisition, 'download_file', download_then_seal)
+    root = tmp_path / 'out' / 'bids'
+
+    download_bids(client, gather_bids(client, 'synthetic'), str(root.parent),
+                  name='bids', dry_run=False)
+
+    published = root / 'sub-01/ses-01/anat/sub-01_ses-01_T1w.nii.gz'
+    published.chmod(0o644)
+    assert published.read_bytes() == (tmp_path / 'sources/scan.nii.gz').read_bytes()
+
+
+def test_publication_falls_back_to_copying_without_hardlink_support(tmp_path, monkeypatch):
+    client = anat_client(tmp_path)
+
+    def unsupported(source, destination, **kwargs):
+        raise OSError(errno.EPERM, 'hardlinks unsupported')
+
+    monkeypatch.setattr(os, 'link', unsupported)
+    root = tmp_path / 'out' / 'bids'
+
+    download_bids(client, gather_bids(client, 'synthetic'), str(root.parent),
+                  name='bids', dry_run=False)
+
+    published = root / 'sub-01/ses-01/anat/sub-01_ses-01_T1w.nii.gz'
+    assert published.read_bytes() == (tmp_path / 'sources/scan.nii.gz').read_bytes()
+
+
+def test_publication_never_overwrites_a_racing_writer(tmp_path, monkeypatch):
+    """Control: each destination is still claimed exclusively at publication."""
+    client = anat_client(tmp_path)
+    sentinel = b'another exporter got here first'
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        real_mkdir(self, *args, **kwargs)
+        if self.name == 'anat' and '.fw-heudiconv-' not in str(self):
+            (self / 'sub-01_ses-01_T1w.nii.gz').write_bytes(sentinel)
+
+    monkeypatch.setattr(Path, 'mkdir', racing_mkdir)
+    root = tmp_path / 'out' / 'bids'
+
+    with pytest.raises(FileExistsError):
+        download_bids(client, gather_bids(client, 'synthetic'), str(root.parent),
+                      name='bids', dry_run=False)
+
+    assert (root / 'sub-01/ses-01/anat/sub-01_ses-01_T1w.nii.gz').read_bytes() == sentinel

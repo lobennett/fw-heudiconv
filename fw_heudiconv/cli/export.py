@@ -408,8 +408,13 @@ def download_bids(
             root.mkdir(parents=True)
             for destination, source in staged.items():
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                with destination.open('xb') as output, source.open('rb') as downloaded:
-                    shutil.copyfileobj(downloaded, output)
+                try:
+                    os.link(source, destination)
+                except FileExistsError:
+                    raise
+                except OSError:
+                    with destination.open('xb') as output, source.open('rb') as downloaded:
+                        shutil.copyfileobj(downloaded, output)
     logger.info('Done!')
     print_directory_tree(str(root))
 
