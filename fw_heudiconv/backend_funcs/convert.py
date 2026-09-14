@@ -160,6 +160,15 @@ def _select_files(files, template):
     return [(f, None) for f in picks]
 
 
+def _only_rejected_images(files, template):
+    """True when QA rejection, not a malformed input, left the template no image."""
+    try:
+        images = [f for f, _ in _select_files(files, template) if _is_nifti(f)]
+    except ValueError:
+        return False
+    return bool(images) and all(_is_qa_ignored(f) for f in images)
+
+
 def _bids_destination(bids):
     """Treat compressed/uncompressed copies as one image destination."""
     filename = bids.get('Filename') or ''
@@ -200,13 +209,8 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
     files.sort(key=operator.itemgetter("name"))
 
     # A QA-rejected copy is never curated, so it can neither win selection nor
-    # take a destination away from a valid copy. An acquisition whose candidates
-    # are all rejected is omitted; nothing else in it is touched.
+    # take a destination away from a valid copy.
     candidates = [f for f in files if not _is_qa_ignored(f)]
-    if files and not candidates:
-        logger.debug('Acquisition %s: every candidate is QA-ignored, nothing to curate',
-                     acquisition_id)
-        return
 
     # Select + index the files this template applies to (echo entities,
     # fieldmap/magnitude split, or upstream positional default).
@@ -217,6 +221,12 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
                              'and the mapped template. Candidates: '
                              + ', '.join(f.name for f in files))
     except ValueError as exc:
+        # Losing every image to QA rejection is a study decision, not a broken
+        # acquisition; anything else still fails fast with the original cause.
+        if _only_rejected_images(files, template):
+            logger.debug('Acquisition %s: every selectable image is QA-rejected, '
+                         'nothing to curate', acquisition_id)
+            return
         raise ValueError('Acquisition {} ({}), template {}: {}'.format(
             acquisition_id, getattr(acquisition_object, 'label', ''), template, exc)) from exc
 

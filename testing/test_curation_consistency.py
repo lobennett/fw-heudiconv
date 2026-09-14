@@ -237,3 +237,59 @@ def test_acquisition_with_only_rejected_candidates_is_omitted_untouched(tmp_path
     assert client.acq.calls == []
     export(client, tmp_path / 'out')
     assert not list((tmp_path / 'out').rglob('*.nii.gz'))
+
+
+def test_rejected_dwi_image_with_live_gradients_is_omitted(tmp_path):
+    files = dwi_set(tmp_path, 'scan')
+    files[0].info['BIDS'] = {'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    client = Client(files)
+    before = copy.deepcopy([f.info for f in files])
+
+    curate(client, template('dwi', 'dwi'))
+
+    assert [f.info for f in files] == before
+    assert client.acq.calls == []
+    export(client, tmp_path / 'out')
+    assert not list((tmp_path / 'out').rglob('*.nii.gz'))
+
+
+def test_rejected_echoes_beside_an_ineligible_image_are_omitted(tmp_path):
+    echoes = [source_file(tmp_path, 'scan_e{}.nii.gz'.format(n), 10, '2026-01-01')
+              for n in (1, 2, 3)]
+    for f in echoes:
+        f.info['BIDS'] = {'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    optcom = source_file(tmp_path, 'scan_optcom.nii.gz', 20, '2026-02-01')
+    client = Client(echoes + [optcom])
+    before = copy.deepcopy([f.info for f in client.acq.files])
+
+    curate(client, template('func', 'task-rest_echo-{echo}_bold'))
+
+    assert [f.info for f in client.acq.files] == before
+    assert client.acq.calls == []
+
+
+def test_rejected_image_beside_unrelated_metadata_is_omitted(tmp_path):
+    rejected = source_file(tmp_path, 'scan.nii.gz', 10, '2026-01-01')
+    rejected.info['BIDS'] = {'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    events = source_file(tmp_path, 'scan_events.tsv', 'onset\n1.0\n', '2026-01-01')
+    client = Client([rejected, events])
+    before = copy.deepcopy([f.info for f in client.acq.files])
+
+    curate(client, template('anat', 'T1w'))
+
+    assert [f.info for f in client.acq.files] == before
+    assert client.acq.calls == []
+
+
+@pytest.mark.parametrize('member', [1, 2])
+def test_rejected_gradient_beside_a_live_dwi_image_still_refuses(tmp_path, member):
+    """Control: QA omission must not swallow an incoherent non-rejected set."""
+    files = dwi_set(tmp_path, 'scan')
+    files[member].info['BIDS'] = {'ignore': True, 'valid': False,
+                                  'error_message': 'QA rejected'}
+    client = Client(files)
+
+    with pytest.raises(ValueError, match='(?i)dwi'):
+        curate(client, template('dwi', 'dwi'))
+
+    assert client.acq.calls == []
