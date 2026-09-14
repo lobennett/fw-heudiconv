@@ -506,10 +506,11 @@ def main():
         destination = args.path
     else:
         destination = args.destination
+    output_root = Path(destination, args.directory_name)
 
     if not os.path.exists(destination):
         logger.info("Creating destination directory...")
-        os.makedirs(args.destination)
+        os.makedirs(destination)
 
     downloads = gather_bids(
         client=fw, project_label=args.project, session_labels=args.session,
@@ -527,7 +528,7 @@ def main():
         )
 
     if args.dry_run:
-        shutil.rmtree(Path(args.destination, args.directory_name))
+        shutil.rmtree(output_root)
 
     logger.info("Done!")
     logger.info("{:=^70}".format(": Exiting fw-heudiconv exporter :"))

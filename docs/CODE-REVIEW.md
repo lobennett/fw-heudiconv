@@ -101,6 +101,12 @@ output the current curation no longer owns (a stale `run-2` beside the new
 `run-1` collides with nothing), and clearing it would destroy prior results.
 There is no overwrite flag; pick an unused `--destination`/`--directory-name`.
 
+The exporter CLI resolves one effective root from `--path`/`--destination` and
+uses it for directory creation, export and dry-run cleanup. A dry run therefore
+removes only the placeholder tree that same invocation created under the chosen
+root, never a prior export sitting under the current directory, and a missing
+`--path` directory is created rather than colliding with `.`.
+
 Export rechecks DWI source pairing, including acquisition identity, even for
 legacy curated tags. Downloads and generated metadata are staged in a temporary
 directory under the output parent. Each downloaded payload is bound to whichever
@@ -161,8 +167,8 @@ matching and ambiguous DWI sources, converter-declared derivative maps and
 unknown/contradictory roles, absent and non-conversion provenance, same-length
 different gradients, gradient validation, dry runs, existing-output-root
 refusal, prior-dataset preservation, failed transports, in-place replacement
-races, actual SDK file models, and a full query → heuristic → curation →
-export path.
+races, actual SDK file models, exporter CLI root resolution and dry-run cleanup,
+and a full query → heuristic → curation → export path.
 
 ## Deferred inherited compatibility limits
 

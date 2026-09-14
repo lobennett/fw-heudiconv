@@ -83,9 +83,6 @@ def _image_component(f):
         return 'conflicting'
     if phase:
         return 'phase'
-    if (stem.endswith(('_real', '_imaginary', '_phMag'))
-            or component in ('REAL', 'IMAGINARY')):
-        return 'other'
     return 'magnitude' if magnitude else None
 
 
@@ -95,7 +92,7 @@ def _is_fieldmap(f):
         return True
     info = getattr(f, 'info', None) or {}
     component = _image_component(f)
-    if component in ('magnitude', 'conflicting', 'other'):
+    if component in ('magnitude', 'conflicting'):
         return False
     return info.get('Units') == 'Hz'
 
@@ -112,7 +109,7 @@ def _select_echo_files(files):
     """
     by_echo = {}
     for f in files:
-        if not _is_nifti(f) or _image_component(f) in ('phase', 'conflicting', 'other'):
+        if not _is_nifti(f) or _image_component(f) in ('phase', 'conflicting'):
             continue
         echo = _echo_number(f.name)
         if echo is None:
