@@ -58,6 +58,8 @@ def test_select_files_splits_fieldmap_and_magnitude():
         FakeFile("sess_11_1_fieldmap.nii.gz"),
         FakeFile("sess_11_1.nii.gz"),  # magnitude (no _fieldmap tag)
     ]
+    # Keep the established explicit fieldmap marker even for stored magnitude components.
+    files[0].info = {'ImageType': ['DERIVED', 'PRIMARY', 'M']}
     fmap = _select_files(files, "sub-{subject}/{session}/fmap/sub-{subject}_{session}_run-1_fieldmap")
     assert [f.name for f, _ in fmap] == ["sess_11_1_fieldmap.nii.gz"]
     mag = _select_files(files, "sub-{subject}/{session}/fmap/sub-{subject}_{session}_run-1_magnitude")
@@ -69,6 +71,6 @@ def test_select_files_echo_and_default():
     files = [FakeFile("r_e1.nii.gz"), FakeFile("r_e2.nii.gz"), FakeFile("r_optcom.nii.gz")]
     assert [e for _, e in _select_files(files, echo_tmpl)] == [1, 2]
     # Anatomical templates keep the NIfTI, un-indexed. Since 2e7187d,
-    # bval/bvec sidecars belong only to DWI, never to an anatomical scan.
+    # bval/bvec gradient sidecars belong only to DWI, never to an anatomical scan.
     anat = [FakeFile("a.nii.gz"), FakeFile("a.bval")]
     assert _select_files(anat, "x_run-1_T1w") == [(anat[0], None)]

@@ -1,4 +1,5 @@
 import logging
+import copy
 import re
 import pdb
 import operator
@@ -11,6 +12,9 @@ from os import path
 from pathvalidate import is_valid_filename
 from pathlib import Path
 from fw_heudiconv.cli.export import get_nested
+from fw_heudiconv.backend_funcs.dwi import (
+    is_dwi_derivative, select_dwi_files, split_image_name,
+)
 
 logger = logging.getLogger('fw-heudiconv-curator')
 
@@ -56,7 +60,7 @@ def force_label_format(str_input):
 
 def _echo_number(filename):
     """Extract echo number from a Flywheel NIfTI name like ``*_e2.nii.gz``."""
-    m = re.search(r"_e(\d+)(?:\.|_)", filename)
+    m = re.search(r"_e(\d+)$", split_image_name(filename)[0])
     return int(m.group(1)) if m else None
 
 
@@ -64,8 +68,41 @@ def _is_nifti(f):
     return f.name.endswith((".nii.gz", ".nii"))
 
 
+def _is_qa_ignored(f):
+    """True when study QA rejected this file, making it unselectable."""
+    bids = (getattr(f, 'info', None) or {}).get('BIDS')
+    return isinstance(bids, dict) and bool(bids.get('ignore'))
+
+
 def _newest(candidates):
-    return max(candidates, key=lambda f: getattr(f, "created", "") or "")
+    return max(candidates, key=lambda f: (getattr(f, "created", "") or "", f.name))
+
+
+def _image_component(f):
+    """Read supported converter component markers, retaining contradictions."""
+    stem = split_image_name(f.name)[0]
+    info = getattr(f, 'info', None) or {}
+    image_type = info.get('ImageType', [])
+    tokens = set(image_type) if isinstance(image_type, (list, tuple)) else set()
+    component = info.get('ComplexImageComponent')
+    phase = stem.endswith('_ph') or 'P' in tokens or component == 'PHASE'
+    magnitude = 'M' in tokens or component == 'MAGNITUDE'
+    if phase and magnitude:
+        return 'conflicting'
+    if phase:
+        return 'phase'
+    return 'magnitude' if magnitude else None
+
+
+def _is_fieldmap(f):
+    """Keep the legacy marker; phase-named maps require converter Hz evidence."""
+    if '_fieldmap' in split_image_name(f.name)[0]:
+        return True
+    info = getattr(f, 'info', None) or {}
+    component = _image_component(f)
+    if component in ('magnitude', 'conflicting'):
+        return False
+    return info.get('Units') == 'Hz'
 
 
 def _select_echo_files(files):
@@ -80,7 +117,7 @@ def _select_echo_files(files):
     """
     by_echo = {}
     for f in files:
-        if not _is_nifti(f):
+        if not _is_nifti(f) or _image_component(f) in ('phase', 'conflicting'):
             continue
         echo = _echo_number(f.name)
         if echo is None:
@@ -96,20 +133,24 @@ def _select_files(files, template):
     """Select + index the files a template applies to (mirrors legacy file_selector).
 
     * ``{echo}`` template  -> raw multi-echo NIfTIs, indexed by echo number.
-    * ``_fieldmap`` suffix -> the single fieldmap NIfTI (``_fieldmap`` in name).
-    * ``_magnitude`` suffix -> the single magnitude NIfTI (the other one).
-    * anything else        -> all convertible files, upstream positional behaviour.
+    * ``_fieldmap`` suffix -> a converter-marked fieldmap or an explicit Hz map.
+    * ``_magnitude`` suffix -> the magnitude NIfTI, excluding phase/components.
+    * ``_dwi`` suffix      -> newest image and its coherent bval/bvec source set.
+    * anything else        -> newest NIfTI only.
 
     Returns ``[(fileobj, echo_or_None)]``.
     """
     if "{echo}" in template:
         return _select_echo_files(files)
+    if template.endswith("_dwi"):
+        return [(f, None) for f in select_dwi_files(files)]
     niftis = [f for f in files if _is_nifti(f)]
     if template.endswith("_fieldmap"):
-        picks = [f for f in niftis if "_fieldmap" in f.name]
+        picks = [f for f in niftis if _is_fieldmap(f)]
         return [(_newest(picks), None)] if picks else []
     if template.endswith("_magnitude"):
-        picks = [f for f in niftis if "_fieldmap" not in f.name]
+        picks = [f for f in niftis if not _is_fieldmap(f)
+                 and _image_component(f) in (None, 'magnitude')]
         return [(_newest(picks), None)] if picks else []
     # Default: one scan per acquisition. Duplicate gear-output NIfTIs (same scan
     # re-derived) collapse to the most recently created — mirrors the legacy
@@ -118,9 +159,26 @@ def _select_files(files, template):
     # belong ONLY to dwi; attaching them to anat produces invalid names like
     # ``_T1w.bval``, so keep them solely for the ``_dwi`` suffix.
     picks = [_newest(niftis)] if niftis else []
-    if template.endswith("_dwi"):
-        picks += [f for f in files if not _is_nifti(f)]
     return [(f, None) for f in picks]
+
+
+def _only_rejected_images(files, template):
+    """True when QA rejection, not a malformed input, left the template no image."""
+    if "{echo}" not in template and template.endswith('_dwi'):
+        # Inspect every eligible raw image before choosing a conversion or
+        # validating its gradients: a rejected winner cannot hide a live error.
+        images = [f for f in files if _is_nifti(f) and not is_dwi_derivative(f)]
+    else:
+        images = [f for f, _ in _select_files(files, template) if _is_nifti(f)]
+    return bool(images) and all(_is_qa_ignored(f) for f in images)
+
+
+def _bids_destination(bids):
+    """Treat compressed/uncompressed copies as one image destination."""
+    filename = bids.get('Filename') or ''
+    if filename.endswith('.nii.gz'):
+        filename = filename[:-3]
+    return bids.get('Path'), filename
 
 
 def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[],
@@ -154,22 +212,43 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
 
     files.sort(key=operator.itemgetter("name"))
 
+    # A QA-rejected copy is never curated, so it can neither win selection nor
+    # take a destination away from a valid copy.
+    candidates = [f for f in files if not _is_qa_ignored(f)]
+
     # Select + index the files this template applies to (echo entities,
     # fieldmap/magnitude split, or upstream positional default).
-    selected = _select_files(files, template)
+    try:
+        selected = _select_files(candidates, template)
+        if not selected:
+            raise ValueError('No valid files selected; inspect converter outputs '
+                             'and the mapped template. Candidates: '
+                             + ', '.join(f.name for f in files))
+    except ValueError as exc:
+        # Losing every image to QA rejection is a study decision, not a broken
+        # acquisition; anything else still fails fast with the original cause.
+        if _only_rejected_images(files, template):
+            logger.debug('Acquisition %s: every selectable image is QA-rejected, '
+                         'nothing to curate', acquisition_id)
+            return
+        raise ValueError('Acquisition {} ({}), template {}: {}'.format(
+            acquisition_id, getattr(acquisition_object, 'label', ''), template, exc)) from exc
 
+    updates = []
     for fnum, (f, echo) in enumerate(selected):
-        fmt = dict(subject=subj_label, session=sess_label, item=fnum + 1, seqitem=item_num)
+        # The three DWI members describe one image, including in {item} templates.
+        item = 1 if template.endswith('_dwi') else fnum + 1
+        fmt = dict(subject=subj_label, session=sess_label, item=item, seqitem=item_num)
         if echo is not None:
             fmt["echo"] = echo
         bids_vals = template.format(**fmt).split("/")
         bids_dict = dict(zip(bids_keys, bids_vals))
         suffix = suffixes[f.type]
+        if _is_nifti(f):
+            suffix = split_image_name(f.name)[1]
 
-        if 'BIDS' not in f.info:
-            f.info['BIDS'] = ""
-        new_bids = f.info['BIDS']
-        if new_bids in ("NA", ""):
+        new_bids = copy.deepcopy(f.info.get('BIDS'))
+        if new_bids in (None, "NA", ""):
             new_bids = add_empty_bids_fields(bids_dict['folder'], bids_dict['name'])
         new_bids['Filename'] = bids_dict['name']+suffix
         new_bids['Folder'] = bids_dict['folder']
@@ -184,7 +263,9 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
         destination = "\n" + f.name + "\n\t" + new_bids['Filename'] + " -> " \
             + new_bids["Path"] + "/" + new_bids['Filename']
         logger.debug(destination)
+        updates.append((f, new_bids))
 
+    for f, new_bids in updates:
         if not dry_run:
             acquisition_object.update_file_info(f.name, {'BIDS': new_bids})
             acquisition_object = client.get(acquisition_id) # Refresh the acquisition object
@@ -213,6 +294,24 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
                 new_metadata = old_metadata.copy()
                 new_metadata.update(metadata_extras)
                 acquisition_object.update_file_info(f.name, new_metadata)
+
+    # Only retire after replacement updates succeed. Older fork versions left
+    # these destinations active on superseded copies.
+    # Match the exact destination within this acquisition: unrelated templates
+    # and study QA fields are not ours to clear. Do not use ignore for retirement;
+    # that field belongs to study QA and must never be unset when reselected.
+    destinations = {_bids_destination(b) for _, b in updates}
+    selected_names = {f.name for f, _ in updates}
+    for f in files:
+        bids = f.info.get('BIDS')
+        if (f.name in selected_names or not isinstance(bids, dict)
+                or _bids_destination(bids) not in destinations):
+            continue
+        retired = copy.deepcopy(bids)
+        retired.update(Path='', Filename='', valid=False)
+        logger.debug('Retiring superseded destination on %s: %s', f.name, bids['Filename'])
+        if not dry_run:
+            acquisition_object.update_file_info(f.name, {'BIDS': retired})
 
 
 def add_empty_bids_fields(folder, fname=None):
