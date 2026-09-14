@@ -408,8 +408,13 @@ def download_bids(
             root.mkdir(parents=True)
             for destination, source in staged.items():
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                with destination.open('xb') as output, source.open('rb') as downloaded:
-                    shutil.copyfileobj(downloaded, output)
+                try:
+                    os.link(source, destination)
+                except FileExistsError:
+                    raise
+                except OSError:
+                    with destination.open('xb') as output, source.open('rb') as downloaded:
+                        shutil.copyfileobj(downloaded, output)
     logger.info('Done!')
     print_directory_tree(str(root))
 
@@ -506,10 +511,11 @@ def main():
         destination = args.path
     else:
         destination = args.destination
+    output_root = Path(destination, args.directory_name)
 
     if not os.path.exists(destination):
         logger.info("Creating destination directory...")
-        os.makedirs(args.destination)
+        os.makedirs(destination)
 
     downloads = gather_bids(
         client=fw, project_label=args.project, session_labels=args.session,
@@ -527,7 +533,7 @@ def main():
         )
 
     if args.dry_run:
-        shutil.rmtree(Path(args.destination, args.directory_name))
+        shutil.rmtree(output_root)
 
     logger.info("Done!")
     logger.info("{:=^70}".format(": Exiting fw-heudiconv exporter :"))

@@ -2,11 +2,10 @@
 
 - This compatibility fork is consumed from `sherlock-compat`. Keep that branch
   as the publication/review base; no-mistakes runs use `--base-branch sherlock-compat`.
+- See the README's "Offline tests" section and `.github/workflows/tests.yml` for the supported CI environment and full offline test command. It deselects the exact live Flywheel client test before construction; do not run that test during offline validation. The legacy CircleCI workflow also performs live Flywheel mutations, so it is not an offline verification command either.
+- `setup.py` declares the installed package dependencies, including the compatibility branch's Flywheel SDK pin. The legacy `setup.cfg` dependency list differs; use the documented package install command.
 - See [docs/CODE-REVIEW.md](docs/CODE-REVIEW.md) for selection/export invariants,
   synthetic regression commands and audit limits.
-- Run offline tests with `python -m pytest testing -k 'not test_client'`.
-  `test_client` requires credentials; the legacy CircleCI workflow also performs
-  live Flywheel mutations. Do not use it as an offline verification command.
 
 ## Maintaining this file
 

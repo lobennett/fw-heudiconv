@@ -44,7 +44,16 @@ tag invalid) on superseded files in the same acquisition with the same rendered
 destination. Compressed and uncompressed NIfTI copies share this identity.
 Other destinations/templates and metadata survive. Retirement does not use
 `BIDS.ignore`; QA rejection, its error text and custom QA fields are retained.
-Selected rejected files stay rejected. Copies of metadata also keep dry curation
+A QA-rejected file is not a selection candidate for ordinary, echo or DWI
+templates, so a rejected newer conversion can neither become the curated copy
+nor retire a valid older one, and curation never writes to it. When QA rejection is what
+leaves the template with no image — every otherwise selectable image is
+rejected, whatever unrelated or non-selectable files remain beside them — that
+selection is omitted with no update at all, rather than raising the
+unmapped-acquisition error. Every other selection failure still fails fast with
+its original cause, including a non-rejected DWI image whose bval or bvec is
+rejected or missing, and a partially rejected set of echoes.
+Copies of metadata also keep dry curation
 from mutating objects returned by the SDK. Non-DWI timestamp ties use filenames
 as a stable tie-breaker; newest selection remains unchanged for unequal times.
 
@@ -100,6 +109,12 @@ or populated — is refused untouched, before any download: merging would leave
 output the current curation no longer owns (a stale `run-2` beside the new
 `run-1` collides with nothing), and clearing it would destroy prior results.
 There is no overwrite flag; pick an unused `--destination`/`--directory-name`.
+
+The exporter CLI resolves one effective root from `--path`/`--destination` and
+uses it for directory creation, export and dry-run cleanup. A dry run therefore
+removes only the placeholder tree that same invocation created under the chosen
+root, never a prior export sitting under the current directory, and a missing
+`--path` directory is created rather than colliding with `.`.
 
 Export rechecks DWI source pairing, including acquisition identity, even for
 legacy curated tags. Downloads and generated metadata are staged in a temporary
@@ -161,8 +176,8 @@ matching and ambiguous DWI sources, converter-declared derivative maps and
 unknown/contradictory roles, absent and non-conversion provenance, same-length
 different gradients, gradient validation, dry runs, existing-output-root
 refusal, prior-dataset preservation, failed transports, in-place replacement
-races, actual SDK file models, and a full query → heuristic → curation →
-export path.
+races, actual SDK file models, exporter CLI root resolution and dry-run cleanup,
+and a full query → heuristic → curation → export path.
 
 ## Deferred inherited compatibility limits
 
@@ -208,11 +223,16 @@ export path.
   consumer wrapper that deletes its output before calling the helper bypasses
   that protection. The Network wrapper's pre-call deletion was identified for
   separate integration work; this fork does not change or validate that wrapper.
-- A partially QA-ignored DWI set is refused as incomplete; an entirely ignored
-  set is omitted. QA flags are never cleared to make a set exportable.
+- A DWI set whose image is live but whose bval or bvec is QA-ignored is refused
+  as incomplete at both curation and export. A set whose image is ignored is
+  omitted, gradients included. QA flags are never cleared to make a set
+  exportable.
 - Dry export keeps the existing placeholder-tree behavior and performs metadata
   and path checks, but cannot validate gradient contents without downloading.
-- Staging requires additional local disk space. Publication is not a multi-file
+- Staging requires local disk space for the dataset, but not a second copy of
+  it: the staging tree shares the output parent's filesystem, so publication
+  hardlinks each staged file into the root and only copies where the filesystem
+  refuses hardlinks. Publication is not a multi-file
   transaction: an I/O failure or concurrent writer during publication may leave
   some new files. Exclusive creation protects prior files, and retries report
   those conflicts. No broad transaction/state framework was introduced.

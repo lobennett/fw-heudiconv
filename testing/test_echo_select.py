@@ -70,6 +70,7 @@ def test_select_files_echo_and_default():
     echo_tmpl = "sub-{subject}/{session}/func/x_run-1_echo-{echo}_bold"
     files = [FakeFile("r_e1.nii.gz"), FakeFile("r_e2.nii.gz"), FakeFile("r_optcom.nii.gz")]
     assert [e for _, e in _select_files(files, echo_tmpl)] == [1, 2]
-    # Anatomical exports have no diffusion gradient sidecars.
+    # Anatomical templates keep the NIfTI, un-indexed. Since 2e7187d,
+    # bval/bvec gradient sidecars belong only to DWI, never to an anatomical scan.
     anat = [FakeFile("a.nii.gz"), FakeFile("a.bval")]
     assert _select_files(anat, "x_run-1_T1w") == [(anat[0], None)]

@@ -66,6 +66,12 @@ def _is_nifti(f):
     return f.name.endswith((".nii.gz", ".nii"))
 
 
+def _is_qa_ignored(f):
+    """True when study QA rejected this file, making it unselectable."""
+    bids = (getattr(f, 'info', None) or {}).get('BIDS')
+    return isinstance(bids, dict) and bool(bids.get('ignore'))
+
+
 def _newest(candidates):
     return max(candidates, key=lambda f: (getattr(f, "created", "") or "", f.name))
 
@@ -83,9 +89,6 @@ def _image_component(f):
         return 'conflicting'
     if phase:
         return 'phase'
-    if (stem.endswith(('_real', '_imaginary', '_phMag'))
-            or component in ('REAL', 'IMAGINARY')):
-        return 'other'
     return 'magnitude' if magnitude else None
 
 
@@ -95,7 +98,7 @@ def _is_fieldmap(f):
         return True
     info = getattr(f, 'info', None) or {}
     component = _image_component(f)
-    if component in ('magnitude', 'conflicting', 'other'):
+    if component in ('magnitude', 'conflicting'):
         return False
     return info.get('Units') == 'Hz'
 
@@ -112,7 +115,7 @@ def _select_echo_files(files):
     """
     by_echo = {}
     for f in files:
-        if not _is_nifti(f) or _image_component(f) in ('phase', 'conflicting', 'other'):
+        if not _is_nifti(f) or _image_component(f) in ('phase', 'conflicting'):
             continue
         echo = _echo_number(f.name)
         if echo is None:
@@ -157,6 +160,15 @@ def _select_files(files, template):
     return [(f, None) for f in picks]
 
 
+def _only_rejected_images(files, template):
+    """True when QA rejection, not a malformed input, left the template no image."""
+    try:
+        images = [f for f, _ in _select_files(files, template) if _is_nifti(f)]
+    except ValueError:
+        return False
+    return bool(images) and all(_is_qa_ignored(f) for f in images)
+
+
 def _bids_destination(bids):
     """Treat compressed/uncompressed copies as one image destination."""
     filename = bids.get('Filename') or ''
@@ -196,15 +208,25 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
 
     files.sort(key=operator.itemgetter("name"))
 
+    # A QA-rejected copy is never curated, so it can neither win selection nor
+    # take a destination away from a valid copy.
+    candidates = [f for f in files if not _is_qa_ignored(f)]
+
     # Select + index the files this template applies to (echo entities,
     # fieldmap/magnitude split, or upstream positional default).
     try:
-        selected = _select_files(files, template)
+        selected = _select_files(candidates, template)
         if not selected:
             raise ValueError('No valid files selected; inspect converter outputs '
                              'and the mapped template. Candidates: '
                              + ', '.join(f.name for f in files))
     except ValueError as exc:
+        # Losing every image to QA rejection is a study decision, not a broken
+        # acquisition; anything else still fails fast with the original cause.
+        if _only_rejected_images(files, template):
+            logger.debug('Acquisition %s: every selectable image is QA-rejected, '
+                         'nothing to curate', acquisition_id)
+            return
         raise ValueError('Acquisition {} ({}), template {}: {}'.format(
             acquisition_id, getattr(acquisition_object, 'label', ''), template, exc)) from exc
 
@@ -229,9 +251,8 @@ def apply_heuristic(client, heur, acquisition_id, dry_run=False, intended_for=[]
         new_bids['Path'] = "/".join([bids_dict['sub'],
                                      bids_dict['ses'],
                                      bids_dict['folder']])
-        if not new_bids.get('ignore'):
-            new_bids['error_message'] = ""
-            new_bids['valid'] = True
+        new_bids['error_message'] = ""
+        new_bids['valid'] = True
 
         infer_params_from_filename(new_bids)
 
