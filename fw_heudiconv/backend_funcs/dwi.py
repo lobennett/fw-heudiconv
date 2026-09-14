@@ -1,5 +1,8 @@
 """DWI source identity shared by curation and export (no SDK calls)."""
 
+DERIVATIVE_IMAGE_TYPES = frozenset(
+    ('ADC', 'EADC', 'TRACEW', 'FA', 'COLFA', 'TENSOR', 'TENSOR_B0', 'EXP'))
+
 
 def split_image_name(name):
     """Return the source stem and imaging extension, including compound .nii.gz."""
@@ -9,13 +12,34 @@ def split_image_name(name):
     return name, ''
 
 
+def derivative_role(f):
+    """Return the converter-declared derivative role of a NIfTI, else ``None``.
+
+    Only positive per-file converter metadata counts: the DICOM ``ImageType``
+    the converter copied into the file's ``info`` must mark the file ``DERIVED``
+    and name a known derivative/reference role. Absent metadata, an unknown
+    role, or a contradictory ``ORIGINAL``/``DERIVED`` pair leaves the file a
+    candidate for the raw image. Filenames and missing gradients never imply a
+    derivative.
+    """
+    image_type = (f.get('info') or {}).get('ImageType')
+    if not isinstance(image_type, (list, tuple)):
+        return None
+    tokens = {str(token).strip().upper() for token in image_type}
+    if 'DERIVED' not in tokens or 'ORIGINAL' in tokens:
+        return None
+    roles = sorted(tokens & DERIVATIVE_IMAGE_TYPES)
+    return roles[0] if roles else None
+
+
 def validate_dwi_sources(files):
-    """Require one named conversion set, rejecting contradictory job provenance.
+    """Require one named conversion set with coherent job provenance.
 
     Matching source stems are the converter's sidecar association, unlike BIDS
-    destinations (assigned later), upload times or equal gradient counts. If
-    job provenance is present, require the same job on all three files. A user
-    or device ID is not a conversion ID.
+    destinations (assigned later), upload times or equal gradient counts. Stems
+    alone do not establish generation, so every member must also carry the same
+    conversion job ID. A user or device ID is not a conversion ID, and an
+    absent origin is not provenance.
     """
     evidence = ', '.join(
         '{} (origin={!r})'.format(f['name'], f.get('origin')) for f in files)
@@ -33,27 +57,33 @@ def validate_dwi_sources(files):
         raise ValueError('Ambiguous DWI pairing: source stems differ; inspect '
                          'the original conversion outputs: ' + evidence)
     origins = [f.get('origin') or {} for f in ordered]
-    jobs = [o.get('id') if o.get('type') == 'job' else None for o in origins]
-    if any(jobs) and (not all(jobs) or len(set(jobs)) != 1):
+    jobs = {o.get('id') if o.get('type') == 'job' else None for o in origins}
+    if len(jobs) != 1 or not next(iter(jobs)):
         raise ValueError('Ambiguous DWI pairing: missing or conflicting conversion '
                          'job provenance; inspect conversion outputs: ' + evidence)
     return ordered
 
 
 def select_dwi_files(files):
-    """Select the newest image and its source sidecars, never extension-wise newest."""
+    """Select the newest raw image and its source sidecars, never extension-wise newest.
+
+    Converter-declared derivative maps never compete to be the raw image, but
+    they are only set aside while a raw candidate remains: an acquisition whose
+    images are all declared derivative is still resolved by creation time.
+    """
     niftis = [f for f in files if split_image_name(f['name'])[1] in ('.nii', '.nii.gz')]
     if not niftis:
         if any(split_image_name(f['name'])[1] in ('.bval', '.bvec') for f in files):
             validate_dwi_sources(files)  # Report orphan gradients with filenames.
         return []
-    if len(niftis) > 1:
-        dates = [f.get('created') for f in niftis]
+    images = [f for f in niftis if not derivative_role(f)] or niftis
+    if len(images) > 1:
+        dates = [f.get('created') for f in images]
         if not all(dates) or dates.count(max(dates)) != 1:
             raise ValueError('Ambiguous DWI image selection: missing or tied creation '
                              'times; inspect conversion outputs: '
-                             + ', '.join(f['name'] for f in niftis))
-    image = max(niftis, key=lambda f: f.get('created') or '')
+                             + ', '.join(f['name'] for f in images))
+    image = max(images, key=lambda f: f.get('created') or '')
     stem = split_image_name(image['name'])[0]
     candidates = [image] + [
         f for f in files if split_image_name(f['name'])[0] == stem

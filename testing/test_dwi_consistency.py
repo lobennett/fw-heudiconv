@@ -5,8 +5,10 @@ import nibabel as nib
 import pytest
 
 from testing.synthetic_flywheel import (
-    Client, Obj, curate, dwi_set, export, source_file, template, tree_bytes,
+    CONVERSION_JOB, Client, Obj, curate, dwi_set, export, source_file, template, tree_bytes,
 )
+
+DERIVED_ADC = {'ImageType': ['DERIVED', 'PRIMARY', 'DIFFUSION', 'ADC']}
 
 
 @pytest.mark.parametrize('reverse', [False, True])
@@ -67,14 +69,16 @@ def test_invalid_gradients_leave_existing_outputs_unchanged(tmp_path, bad_file, 
     (tmp_path / ('scan.' + bad_file)).write_text(text)
     client = Client(files)
     curate(client, template('dwi', 'dwi'))
-    root = tmp_path / 'out' / 'bids'
-    root.mkdir(parents=True)
-    (root / 'prior.txt').write_text('valid previous output')
-    before = tree_bytes(root)
+    out = tmp_path / 'out'
+    prior = out / 'prior_bids'
+    prior.mkdir(parents=True)
+    (prior / 'prior.txt').write_text('valid previous output')
+    before = tree_bytes(prior)
     with pytest.raises(ValueError, match='(?i)gradient') as exc:
-        export(client, root.parent)
+        export(client, out)
     assert 'scan' in str(exc.value)
-    assert tree_bytes(root) == before
+    assert tree_bytes(prior) == before
+    assert not (out / 'bids').exists()
 
 
 def test_export_rejects_legacy_same_count_mixed_sources(tmp_path):
@@ -91,7 +95,7 @@ def test_export_rejects_legacy_same_count_mixed_sources(tmp_path):
     assert not (tmp_path / 'out' / 'bids').exists()
 
 
-@pytest.mark.parametrize('origin', [None, Obj(type='job', id='conversion')])
+@pytest.mark.parametrize('origin', [CONVERSION_JOB, Obj(type='job', id='dcm2niix-42')])
 def test_single_coherent_set_and_qa_preservation(tmp_path, origin):
     files = dwi_set(tmp_path, 'scan', origin=origin)
     client = Client(files)
@@ -137,15 +141,19 @@ def test_sdk_file_models_follow_same_pairing_rules():
     files[1].origin = FileOrigin(type='job', id='other-conversion')
     with pytest.raises(ValueError, match='provenance'):
         select_dwi_files(files)
+    files[1].origin = None
+    with pytest.raises(ValueError, match='provenance'):
+        select_dwi_files(files)
 
 
 def test_failed_download_publishes_no_partial_set(tmp_path, monkeypatch):
     client = Client(dwi_set(tmp_path, 'scan'))
     curate(client, template('dwi', 'dwi'))
-    root = tmp_path / 'out' / 'bids'
-    root.mkdir(parents=True)
-    (root / 'prior.txt').write_text('prior result')
-    before = tree_bytes(root)
+    out = tmp_path / 'out'
+    prior = out / 'prior_bids'
+    prior.mkdir(parents=True)
+    (prior / 'prior.txt').write_text('prior result')
+    before = tree_bytes(prior)
     download = type(client.acq).download_file
 
     def fail_bvec(acq, name, dest):
@@ -155,9 +163,74 @@ def test_failed_download_publishes_no_partial_set(tmp_path, monkeypatch):
 
     monkeypatch.setattr(type(client.acq), 'download_file', fail_bvec)
     with pytest.raises(OSError, match='synthetic'):
-        export(client, root.parent)
-    assert tree_bytes(root) == before
-    assert not list(root.parent.glob('.fw-heudiconv-*'))
+        export(client, out)
+    assert tree_bytes(prior) == before
+    assert not (out / 'bids').exists()
+    assert not list(out.glob('.fw-heudiconv-*'))
+
+
+def test_replaced_file_version_is_refused_before_publishing(tmp_path, monkeypatch):
+    files = dwi_set(tmp_path, 'scan')
+    client = Client(files)
+    curate(client, template('dwi', 'dwi'))
+    download = type(client.acq).download_file
+
+    def replace_nifti(acq, name, dest):
+        download(acq, name, dest)
+        if name.endswith('.nii.gz'):
+            entry = acq.get_file(name)
+            entry.version += 1
+            entry.hash = 'sha256:replaced-in-place'
+
+    monkeypatch.setattr(type(client.acq), 'download_file', replace_nifti)
+    with pytest.raises(ValueError, match='replaced during export') as exc:
+        export(client, tmp_path / 'out')
+    assert 'scan.nii.gz' in str(exc.value)
+    assert not (tmp_path / 'out' / 'bids').exists()
+
+
+def test_derived_map_never_displaces_the_raw_dwi_image(tmp_path):
+    files = dwi_set(tmp_path, 'scan', created='2026-01-01')
+    files.append(source_file(tmp_path, 'scan_ADC.nii.gz', 99, '2026-03-01',
+                             CONVERSION_JOB, DERIVED_ADC))
+    client = Client(files)
+    curate(client, template('dwi', 'dwi'))
+    export(client, tmp_path / 'out')
+    image, = (tmp_path / 'out').rglob('*.nii.gz')
+    assert image.name == 'sub-01_ses-01_dwi.nii.gz'
+    assert nib.load(image).get_fdata().mean() == 20
+    assert image.with_name('sub-01_ses-01_dwi.bval').read_text() == '0 1000 2000\n'
+    assert 'BIDS' not in files[3].info
+
+
+@pytest.mark.parametrize('image_type', [
+    ['DERIVED', 'PRIMARY', 'M', 'ND'],
+    ['ORIGINAL', 'DERIVED', 'DIFFUSION', 'ADC'],
+    'DERIVED\\PRIMARY\\DIFFUSION\\ADC',
+])
+def test_unknown_or_contradictory_roles_stay_candidates(tmp_path, image_type):
+    files = dwi_set(tmp_path, 'scan', created='2026-01-01')
+    files.append(source_file(tmp_path, 'scan_other.nii.gz', 99, '2026-03-01',
+                             CONVERSION_JOB, {'ImageType': image_type}))
+    client = Client(files)
+    with pytest.raises(ValueError, match='(?i)DWI') as exc:
+        curate(client, template('dwi', 'dwi'))
+    assert 'scan_other.nii.gz' in str(exc.value)
+    assert client.acq.calls == []
+
+
+@pytest.mark.parametrize('origin', [
+    None, Obj(type='user', id='someone@example.org'), Obj(type='job'), Obj(type='job', id=''),
+])
+def test_absent_or_nonconversion_provenance_is_refused(tmp_path, origin):
+    files = dwi_set(tmp_path, 'scan', origin=origin)
+    client = Client(files)
+    before = copy.deepcopy([f.info for f in files])
+    with pytest.raises(ValueError, match='provenance') as exc:
+        curate(client, template('dwi', 'dwi'))
+    assert 'scan.nii.gz' in str(exc.value)
+    assert [f.info for f in files] == before
+    assert client.acq.calls == []
 
 
 def test_incomplete_new_conversion_does_not_fall_back_to_older_set(tmp_path):
