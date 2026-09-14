@@ -46,13 +46,18 @@ Other destinations/templates and metadata survive. Retirement does not use
 `BIDS.ignore`; QA rejection, its error text and custom QA fields are retained.
 A QA-rejected file is not a selection candidate for ordinary, echo or DWI
 templates, so a rejected newer conversion can neither become the curated copy
-nor retire a valid older one, and curation never writes to it. When QA rejection is what
+nor retire a valid older one. Retirement may still clear a rejected copy's stale
+destination while preserving its QA metadata. When QA rejection is what
 leaves the template with no image — every otherwise selectable image is
 rejected, whatever unrelated or non-selectable files remain beside them — that
 selection is omitted with no update at all, rather than raising the
 unmapped-acquisition error. Every other selection failure still fails fast with
 its original cause, including a non-rejected DWI image whose bval or bvec is
-rejected or missing, and a partially rejected set of echoes.
+rejected or missing. DWI omission checks all eligible raw images before choosing
+the newest conversion or checking its gradients: a newer rejected set cannot
+hide an incomplete live set, and an entirely image-rejected acquisition needs
+no complete gradient set to be omitted. Existing selection of non-rejected
+echoes is unchanged.
 Copies of metadata also keep dry curation
 from mutating objects returned by the SDK. Non-DWI timestamp ties use filenames
 as a stable tie-breaker; newest selection remains unchanged for unequal times.
@@ -156,6 +161,12 @@ expected an anatomical bval despite the intentional DWI-only sidecar change;
 its assertion was corrected without restoring invalid sidecars. The first
 regression run failed at 36 expected assertions before the implementation.
 Final local package and regression suite: **110 passed, 1 deselected**.
+Later pipeline QA-selection corrections passed **127 focused tests**. Before
+direct publication, four added QA-omission cases failed against the last
+pipeline head, with three passing controls. After correcting raw-image
+eligibility in that omission check, the curation/DWI modules passed **57 tests**.
+Earlier package results were reused; further validator rounds were stopped at
+the user's request in favor of direct publication and the existing offline CI.
 The initial review correction reported 73 passing tests, but its replacement
 mock changed the cached SDK metadata and missed a real selection/download race.
 The replacement regressions now model remote bytes changing independently of

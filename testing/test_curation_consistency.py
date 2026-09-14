@@ -239,9 +239,11 @@ def test_acquisition_with_only_rejected_candidates_is_omitted_untouched(tmp_path
     assert not list((tmp_path / 'out').rglob('*.nii.gz'))
 
 
-def test_rejected_dwi_image_with_live_gradients_is_omitted(tmp_path):
+@pytest.mark.parametrize('gradient_indices', [(1, 2), (1,), ()])
+def test_rejected_dwi_image_is_omitted_with_any_gradients(tmp_path, gradient_indices):
     files = dwi_set(tmp_path, 'scan')
     files[0].info['BIDS'] = {'ignore': True, 'valid': False, 'error_message': 'QA rejected'}
+    files = [files[0]] + [files[i] for i in gradient_indices]
     client = Client(files)
     before = copy.deepcopy([f.info for f in files])
 
@@ -282,11 +284,18 @@ def test_rejected_image_beside_unrelated_metadata_is_omitted(tmp_path):
 
 
 @pytest.mark.parametrize('member', [1, 2])
-def test_rejected_gradient_beside_a_live_dwi_image_still_refuses(tmp_path, member):
+@pytest.mark.parametrize('newer_rejected_set', [False, True])
+def test_rejected_gradient_beside_a_live_dwi_image_still_refuses(
+        tmp_path, member, newer_rejected_set):
     """Control: QA omission must not swallow an incoherent non-rejected set."""
-    files = dwi_set(tmp_path, 'scan')
+    files = dwi_set(tmp_path, 'scan', 10, '2026-01-01')
     files[member].info['BIDS'] = {'ignore': True, 'valid': False,
                                   'error_message': 'QA rejected'}
+    if newer_rejected_set:
+        rejected = dwi_set(tmp_path / 'newer', 'rescan', 20, '2026-02-01')
+        for f in rejected:
+            f.info['BIDS'] = {'ignore': True, 'error_message': 'QA rejected'}
+        files.extend(rejected)
     client = Client(files)
 
     with pytest.raises(ValueError, match='(?i)dwi'):

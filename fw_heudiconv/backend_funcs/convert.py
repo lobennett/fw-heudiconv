@@ -12,7 +12,9 @@ from os import path
 from pathvalidate import is_valid_filename
 from pathlib import Path
 from fw_heudiconv.cli.export import get_nested
-from fw_heudiconv.backend_funcs.dwi import select_dwi_files, split_image_name
+from fw_heudiconv.backend_funcs.dwi import (
+    is_dwi_derivative, select_dwi_files, split_image_name,
+)
 
 logger = logging.getLogger('fw-heudiconv-curator')
 
@@ -162,10 +164,12 @@ def _select_files(files, template):
 
 def _only_rejected_images(files, template):
     """True when QA rejection, not a malformed input, left the template no image."""
-    try:
+    if "{echo}" not in template and template.endswith('_dwi'):
+        # Inspect every eligible raw image before choosing a conversion or
+        # validating its gradients: a rejected winner cannot hide a live error.
+        images = [f for f in files if _is_nifti(f) and not is_dwi_derivative(f)]
+    else:
         images = [f for f, _ in _select_files(files, template) if _is_nifti(f)]
-    except ValueError:
-        return False
     return bool(images) and all(_is_qa_ignored(f) for f in images)
 
 
