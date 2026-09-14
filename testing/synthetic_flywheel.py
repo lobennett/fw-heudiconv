@@ -1,5 +1,6 @@
 """Local SDK transport for synthetic curation/export tests; never authenticates."""
 import copy
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,7 +63,10 @@ class Client:
         return [Obj(_id='acq')]
 
 
-def source_file(root, name, value=20, created='2026-02-01', origin=None):
+CONVERSION_JOB = Obj(type='job', id='conversion')
+
+
+def source_file(root, name, value=20, created='2026-02-01', origin=None, info=None):
     source = root / name
     source.parent.mkdir(parents=True, exist_ok=True)
     if name.endswith(('.nii.gz', '.nii')):
@@ -71,11 +75,14 @@ def source_file(root, name, value=20, created='2026-02-01', origin=None):
     else:
         ftype = name.rsplit('.', 1)[-1]
         source.write_text(value)
+    metadata = {'StudyNote': {'keep': ['unchanged']}}
+    metadata.update(info or {})
     return Obj(name=name, type=ftype, created=created, source=str(source), origin=origin,
-               info={'StudyNote': {'keep': ['unchanged']}}, parent=Obj(id='acq'))
+               version=1, hash=hashlib.sha256(source.read_bytes()).hexdigest(),
+               info=metadata, parent=Obj(id='acq'))
 
 
-def dwi_set(root, stem, value=20, created='2026-02-01', origin=None):
+def dwi_set(root, stem, value=20, created='2026-02-01', origin=CONVERSION_JOB):
     return [source_file(root, stem + '.nii.gz', value, created, origin),
             source_file(root, stem + '.bval', '0 1000 2000\n', created, origin),
             source_file(root, stem + '.bvec', '0 1 0\n0 0 1\n0 0 0\n', created, origin)]

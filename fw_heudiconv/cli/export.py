@@ -43,6 +43,17 @@ def get_nested(dct, *keys):
     return dct
 
 
+def file_identity(f):
+    """Return whichever SDK version/hash identities the selected file exposes.
+
+    Flywheel replaces a file in place under the same name, so a name is not an
+    identity. Only recorded, non-empty values are usable; absent ones are not
+    reconstructible and simply leave the download unbound.
+    """
+    return {key: value for key, value in (('version', get_nested(f, 'version')),
+                                          ('hash', get_nested(f, 'hash'))) if value}
+
+
 def normalize_timing_units(d):
     """Coerce DICOM-native millisecond timing fields to BIDS seconds, in place.
 
@@ -215,6 +226,7 @@ def gather_bids(client, project_label, subject_labels=None, session_labels=None)
             'type': af.type,
             'data': af.parent.id,
             'origin': get_nested(af, 'origin'),
+            'identity': file_identity(af),
             'BIDS': get_nested(af, 'info', 'BIDS'),
             'sidecar': get_nested(af, 'info')
         }
@@ -229,21 +241,20 @@ def _export_entries(to_download, root, folders, attachments):
     """Resolve every payload and generated sidecar before touching the output tree."""
     entries = []
 
-    def add(relative, kind, data, source, preserve_existing=False):
+    def add(relative, kind, data, source):
         relative = Path(relative)
         destination = (root / relative).resolve()
         if relative.is_absolute() or root not in destination.parents:
             raise ValueError('BIDS destination escapes output root: {} ({})'.format(
                 relative, source))
-        entries.append(dict(path=destination, kind=kind, data=data, source=source,
-                            preserve_existing=preserve_existing))
+        entries.append(dict(path=destination, kind=kind, data=data, source=source))
 
     if to_download['dataset_description']:
         description = to_download['dataset_description'][0]
-        add(description['name'], 'json', description['data'], 'dataset description', True)
+        add(description['name'], 'json', description['data'], 'dataset description')
     if not any(f['name'] == '.bidsignore' for f in to_download['project']):
         add('.bidsignore', 'text', 'perf/\nqsm/\n**/fmap/*.bvec\n**/fmap/*.bval',
-            'default BIDS ignore', True)
+            'default BIDS ignore')
 
     for level in ('project', 'subject', 'session', 'acquisition'):
         for fi in to_download[level]:
@@ -278,6 +289,7 @@ def _export_entries(to_download, root, folders, attachments):
 
 
 def _preflight_destinations(entries):
+    """Reject curations that cannot be written as one coherent tree."""
     owners = {}
     for entry in entries:
         destination = entry['path']
@@ -285,13 +297,9 @@ def _preflight_destinations(entries):
             raise FileExistsError('Conflicting BIDS destination {}: {} and {}'.format(
                 destination, owners[destination], entry['source']))
         owners[destination] = entry['source']
-        if destination.exists() or destination.is_symlink():
-            if not (entry['preserve_existing'] and destination.is_file()):
-                raise FileExistsError('BIDS destination already exists: {} ({})'.format(
-                    destination, entry['source']))
     for destination, source in owners.items():
         for parent in destination.parents:
-            if parent in owners or (parent.exists() and not parent.is_dir()):
+            if parent in owners:
                 raise FileExistsError('Conflicting BIDS directory {} for {} ({})'.format(
                     parent, destination, source))
 
@@ -340,6 +348,18 @@ def _validate_dwi_gradients(group, staged):
         raise ValueError('Invalid DWI gradients for {}: {}'.format(evidence, exc)) from exc
 
 
+def _verify_file_identity(container, data):
+    """Refuse bytes from a file replaced in place since selection."""
+    selected = data.get('identity')
+    if not selected:
+        return
+    current = file_identity(container.get_file(data['name']))
+    if any(current.get(key) != value for key, value in selected.items()):
+        raise ValueError(
+            'File {} was replaced during export: selected {}, downloaded {}; recurate '
+            'and export again'.format(data['name'], selected, current))
+
+
 def download_bids(
     client, to_download, root_path,
     folders_to_download=['anat', 'dwi', 'func', 'fmap', 'perf'],
@@ -349,28 +369,35 @@ def download_bids(
     entries = _export_entries(to_download, root, folders_to_download, attachments)
     _preflight_destinations(entries)
     dwi_sets = list(_dwi_export_sets(entries))
-    # Existing study-level metadata belongs to the study; defaults initialize it
-    # only when absent. All payload/sidecar collisions above are errors.
-    pending = [entry for entry in entries
-               if not (entry['preserve_existing'] and entry['path'].exists())]
+    # An export writes one whole dataset. Merging into an existing tree would
+    # silently mix it with output the current curation no longer owns, and
+    # deleting that tree would destroy prior results, so refuse it untouched.
+    if root.exists() or root.is_symlink():
+        raise FileExistsError(
+            'BIDS output directory already exists: {}. Export never merges into or '
+            'deletes prior output; choose an unused --destination/--directory-name.'
+            .format(root))
     if dry_run:
         logger.info('Preparing output directory tree (gradient contents are not checked)...')
-        for entry in pending:
+        root.mkdir(parents=True)
+        for entry in entries:
             entry['path'].parent.mkdir(parents=True, exist_ok=True)
             entry['path'].touch(exist_ok=False)
     else:
         logger.info('Downloading files...')
         # Stage under the chosen destination parent. Failed downloads or invalid
-        # DWI contents cannot overwrite prior output or leave a mixed source set.
+        # DWI contents leave no output root behind at all.
         root.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='.fw-heudiconv-', dir=root.parent) as scratch:
             staged = {}
-            for entry in pending:
+            for entry in entries:
                 target = Path(scratch) / entry['path'].relative_to(root)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 kind, data = entry['kind'], entry['data']
                 if kind == 'file':
-                    client.get(data['data']).download_file(data['name'], str(target))
+                    container = client.get(data['data'])
+                    container.download_file(data['name'], str(target))
+                    _verify_file_identity(container, data)
                 elif kind in ('json', 'sidecar'):
                     download_sidecar(data, str(target), remove_bids=(kind == 'sidecar'))
                 else:
@@ -378,9 +405,9 @@ def download_bids(
                 staged[entry['path']] = target
             for group in dwi_sets:
                 _validate_dwi_gradients(group, staged)
-            # Recheck after downloads, then publish without overwriting even if
-            # another exporter races us. This is not a multi-file transaction.
-            _preflight_destinations(entries)
+            # Claim the root exclusively, so an exporter racing us into the same
+            # dataset fails here rather than interleaving two curations.
+            root.mkdir(parents=True)
             for destination, source in staged.items():
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 with destination.open('xb') as output, source.open('rb') as downloaded:

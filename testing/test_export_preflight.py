@@ -9,22 +9,28 @@ from testing.synthetic_flywheel import (
 )
 
 
-@pytest.mark.parametrize('extension', ['nii.gz', 'json', 'bval', 'bvec'])
+@pytest.mark.parametrize('existing', ['stale_run', 'colliding_payload', 'empty'])
 @pytest.mark.parametrize('dry_run', [False, True])
-def test_existing_destination_conflict_preserves_whole_tree(tmp_path, extension, dry_run):
+def test_existing_output_root_is_refused_untouched(tmp_path, existing, dry_run):
+    """An export writes a whole new dataset; it never merges into a prior one."""
     client = Client(dwi_set(tmp_path, 'scan'))
     curate(client, template('dwi', 'dwi'))
     root = tmp_path / 'out' / 'bids'
-    dest = root / 'sub-01/ses-01/dwi' / ('sub-01_ses-01_dwi.' + extension)
-    dest.parent.mkdir(parents=True)
-    dest.write_bytes(b'previous valid output')
-    (root / 'dataset_description.json').write_text('{"Name":"prior study"}')
-    (root / '.bidsignore').write_text('study-specific-pattern\n')
+    root.mkdir(parents=True)
+    if existing != 'empty':
+        # A run number the current curation no longer owns collides with nothing.
+        name = 'sub-01_ses-01_dwi.nii.gz' if existing == 'colliding_payload' \
+            else 'sub-01_ses-01_run-2_dwi.nii.gz'
+        stale = root / 'sub-01/ses-01/dwi' / name
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b'previous valid output')
+        (root / 'dataset_description.json').write_text('{"Name":"prior study"}')
+        (root / '.bidsignore').write_text('study-specific-pattern\n')
     before = tree_bytes(root)
     with pytest.raises(FileExistsError) as exc:
         download_bids(client, gather_bids(client, 'synthetic'), str(root.parent),
                       name='bids', dry_run=dry_run)
-    assert str(dest) in str(exc.value)
+    assert str(root) in str(exc.value)
     assert tree_bytes(root) == before
     assert client.acq.downloads == []
 
@@ -50,16 +56,18 @@ def test_successful_export_preserves_metadata_and_does_not_modify_input(tmp_path
     curate(client, template('anat', 'T1w'))
     rows = gather_bids(client, 'synthetic')
     before_rows = copy.deepcopy(rows)
+    prior = tmp_path / 'out' / 'prior_bids'
+    prior.mkdir(parents=True)
+    (prior / 'dataset_description.json').write_text('{"Name":"prior study"}')
+    (prior / '.bidsignore').write_text('study-specific-pattern\n')
+    before_files = tree_bytes(prior)
     root = tmp_path / 'out' / 'bids'
-    root.mkdir(parents=True)
-    (root / 'dataset_description.json').write_text('{"Name":"prior study"}')
-    (root / '.bidsignore').write_text('study-specific-pattern\n')
-    before_files = tree_bytes(root)
     download_bids(client, rows, str(root.parent), name='bids', dry_run=False)
-    for filename, data in before_files.items():
-        assert (root / filename).read_bytes() == data
+    assert tree_bytes(prior) == before_files
     assert rows == before_rows
     assert len(list(root.rglob('*.nii.gz'))) == 1
+    assert (root / 'dataset_description.json').exists()
+    assert (root / '.bidsignore').exists()
 
 
 def test_ignored_and_filtered_conflicts_do_not_block_export(tmp_path):
