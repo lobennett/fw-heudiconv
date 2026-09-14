@@ -12,24 +12,30 @@ def split_image_name(name):
     return name, ''
 
 
-def derivative_role(f):
-    """Return the converter-declared derivative role of a NIfTI, else ``None``.
+def is_dwi_derivative(f):
+    """Recognize positive converter metadata for derived maps and SBRef images.
 
     Only positive per-file converter metadata counts: the DICOM ``ImageType``
     the converter copied into the file's ``info`` must mark the file ``DERIVED``
-    and name a known derivative/reference role. Absent metadata, an unknown
+    and name a known map role. A diffusion ``ORIGINAL`` with a SeriesDescription
+    ending in ``_SBRef`` is a converter-recognized reference. Absent metadata, an unknown
     role, or a contradictory ``ORIGINAL``/``DERIVED`` pair leaves the file a
     candidate for the raw image. Filenames and missing gradients never imply a
     derivative.
     """
-    image_type = (f.get('info') or {}).get('ImageType')
+    info = f.get('info') or {}
+    image_type = info.get('ImageType')
     if not isinstance(image_type, (list, tuple)):
-        return None
+        return False
     tokens = {str(token).strip().upper() for token in image_type}
-    if 'DERIVED' not in tokens or 'ORIGINAL' in tokens:
-        return None
-    roles = sorted(tokens & DERIVATIVE_IMAGE_TYPES)
-    return roles[0] if roles else None
+    if {'DERIVED', 'ORIGINAL'} <= tokens:
+        return False
+    roles = tokens & DERIVATIVE_IMAGE_TYPES
+    description = info.get('SeriesDescription')
+    reference = isinstance(description, str) and description.upper().endswith('_SBREF')
+    if roles:
+        return len(roles) == 1 and 'DERIVED' in tokens and not reference
+    return reference and {'ORIGINAL', 'DIFFUSION'} <= tokens
 
 
 def validate_dwi_sources(files):
@@ -67,16 +73,19 @@ def validate_dwi_sources(files):
 def select_dwi_files(files):
     """Select the newest raw image and its source sidecars, never extension-wise newest.
 
-    Converter-declared derivative maps never compete to be the raw image, but
-    they are only set aside while a raw candidate remains: an acquisition whose
-    images are all declared derivative is still resolved by creation time.
+    Converter-declared derivatives never compete to be the raw image. An
+    acquisition containing only known derivatives has no raw DWI candidate.
     """
     niftis = [f for f in files if split_image_name(f['name'])[1] in ('.nii', '.nii.gz')]
     if not niftis:
         if any(split_image_name(f['name'])[1] in ('.bval', '.bvec') for f in files):
             validate_dwi_sources(files)  # Report orphan gradients with filenames.
         return []
-    images = [f for f in niftis if not derivative_role(f)] or niftis
+    images = [f for f in niftis if not is_dwi_derivative(f)]
+    if not images:
+        raise ValueError('No raw DWI candidate: all images have known converter '
+                         'derivative/reference roles; inspect outputs: '
+                         + ', '.join(f['name'] for f in niftis))
     if len(images) > 1:
         dates = [f.get('created') for f in images]
         if not all(dates) or dates.count(max(dates)) != 1:

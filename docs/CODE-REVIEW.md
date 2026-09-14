@@ -48,6 +48,25 @@ Selected rejected files stay rejected. Copies of metadata also keep dry curation
 from mutating objects returned by the SDK. Non-DWI timestamp ties use filenames
 as a stable tie-breaker; newest selection remains unchanged for unequal times.
 
+Magnitude BOLD selection accepts a terminal `_e<N>` before the NIfTI extension,
+excluding `_e<N>_ph` and positive phase/component metadata. Equal timestamps
+therefore cannot make a phase reconstruction replace a magnitude echo.
+The Network default's `fmap-fieldmap` acquisition maps to separate
+`_run-1_fieldmap` and `_run-1_magnitude` templates. Its legacy `_fieldmap` filename
+marker remains supported; a phase-named map also needs explicit converter
+`Units: Hz` to satisfy that mapping. `_ph` alone identifies a phase map, not
+its units ([dcm2niix naming reference](https://github.com/rordenlab/dcm2niix/blob/master/FILENAMING.md)).
+The heuristic's own `MetadataExtras` cannot supply missing source-unit evidence.
+Magnitude selection excludes phase files. These changes do not add generic
+`part`/`item` template support or convert image values/units.
+
+An explicitly mapped acquisition with no selected files raises an error naming
+the acquisition, template and available filenames. Uncertain DWI provenance
+likewise includes acquisition/template context. Curation deliberately stops at
+that failure: previously processed acquisitions may already have been updated;
+later ones are not visited. There is no catch-and-continue mechanism or rollback
+of prior curation. No live curation was performed to test this behavior.
+
 DWI curation selects the newest raw image and exactly one bval/bvec sharing its
 **original source stem**. Stems alone do not establish generation, so all three
 must additionally carry the same conversion job ID: an absent origin, a
@@ -60,6 +79,9 @@ fallback to an older complete set and no warning-only path.
 Converter-declared derivative maps (ADC/TRACEW/FA/... in the file's own DICOM
 `ImageType`, marked `DERIVED` and not `ORIGINAL`) never compete to be the raw
 image, so an ADC map uploaded after its parent image cannot hijack the stem.
+An `ORIGINAL`/`DIFFUSION` image with converter `SeriesDescription` ending in
+`_SBRef` is a recognized reference. An acquisition containing only known
+derivatives/references is refused rather than treating one as raw DWI.
 This uses positive per-file converter metadata only: unknown roles,
 contradictory `ORIGINAL`/`DERIVED` pairs and absent metadata leave a file a
 candidate, filenames are never parsed, and missing gradients never imply a
@@ -82,12 +104,20 @@ There is no overwrite flag; pick an unused `--destination`/`--directory-name`.
 Export rechecks DWI source pairing, including acquisition identity, even for
 legacy curated tags. Downloads and generated metadata are staged in a temporary
 directory under the output parent. Each downloaded payload is bound to whichever
-SDK `version`/`hash` identity the selected file exposed at gather time, so a
-file replaced in place during the export window is refused; this detects a
-replacement, it cannot reconstruct provenance the server never recorded. Before
+SDK `version`/`hash` identity the selected file exposed at gather time, including
+study attachments. These are **download request arguments**, forwarded through
+the SDK to the server, not post-download comparisons with its cached file list.
+A retained selected version can still be downloaded after replacement; an
+unavailable version or conflicting hash must fail at the server. Version zero
+is retained if supplied. This binding cannot reconstruct missing conversion
+provenance, and a file with neither identity remains unbound. Before
 publishing any files, NIfTI dimensions must describe a nonempty 3D/4D image,
-bvals must be `1 × N`, bvecs `3 × N`, and gradients must be finite, where N is
-the image's volume count (one for 3D). Invalid gradients, a replaced file or a
+bvals must contain N whitespace-separated values (including one per line),
+bvecs must be `3 × N`, and gradients must be finite, where N is
+the image's volume count (one for 3D). This is the supported Network image
+contract; 5D support has not been established. Content checks protect export
+integrity after provenance establishes pairing; equal counts never prove it.
+Invalid gradients, a failed identity-bound request or a
 failed download leave no output root behind and prior datasets intact.
 Publication creates the root exclusively, so a racing exporter fails rather than
 interleaving two curations, and never deletes an output tree.
@@ -110,10 +140,17 @@ Baseline package tests: **11 passed, 1 failed, 1 deselected**. The failing test
 expected an anatomical bval despite the intentional DWI-only sidecar change;
 its assertion was corrected without restoring invalid sidecars. The first
 regression run failed at 36 expected assertions before the implementation.
-Final package and regression suite: **73 passed, 1 deselected**. Each review
-correction above was re-run against the pre-correction source first and failed
-there: derived-map selection, replaced-file detection, absent/non-conversion
-provenance and existing-output-root refusal.
+Final local package and regression suite: **110 passed, 1 deselected**.
+The initial review correction reported 73 passing tests, but its replacement
+mock changed the cached SDK metadata and missed a real selection/download race.
+The replacement regressions now model remote bytes changing independently of
+the SDK cache: a name-only request publishes image value 99 instead of selected
+value 20, or same-length bvals `0 500 500` instead of `0 1000 2000`. Version-bound
+requests retain the selected data; hash-only replacement requests fail without
+publishing. A separate test exercises the real SDK container download method
+with only its transport boundary mocked. The recovery regressions had **23
+expected failures and 10 passing controls** before correction; attachment
+identity and existing-symlink controls added another four expected failures.
 
 `test_client` is deliberately deselected because it constructs a credentialed
 live Flywheel client. The legacy CircleCI job also logs in and mutates its gear
@@ -127,6 +164,28 @@ refusal, prior-dataset preservation, failed transports, in-place replacement
 races, actual SDK file models, and a full query → heuristic → curation →
 export path.
 
+## Deferred inherited compatibility limits
+
+- The checked Network default uses `{seqitem}`/`{echo}` functional templates
+  and fixed anatomical/DWI/fieldmap suffixes, not generic `{item}` enumeration.
+  The inherited newest-only generic selection still cannot enumerate two
+  magnitude images using `magnitude{item}` or independently handle generic
+  `part-mag`/`part-phase` templates. Custom heuristics remain possible and were
+  not inventoried historically. These behaviors are deferred; templates and
+  run numbering have not been redesigned.
+- The inherited timing policy still rescales numeric TR above 100 and TE above
+  1; short millisecond TRs below the threshold remain ambiguous. The checked
+  default label allowlist has no QSM/MEGRE mapping, but that does not establish
+  absence of short-TR inputs in admitted anatomy/fieldmaps or custom heuristics.
+  No participant TR inventory was performed. The thresholds are unchanged.
+- At the audited `sherlock-compat` base, `setup.py` and `requirements.txt` already
+  pinned SDK 21.5.0, whose installed package metadata requires Python >=3.10.
+  `Dockerfile` and `.circleci/config.yml` already used Python 3.7; the Dockerfile
+  also preinstalled SDK 14.6.5 and `requirements.txt` still listed `heudiconv`.
+  These legacy gear builds are unsupported/unvalidated by this audit. No image
+  interpreter, deployment or dependency pin was changed. The Network Python
+  package path, not a deployed Flywheel gear, is the consumer checked here.
+
 ## Limits
 
 - No live SDK writes, participant reruns, remote compute or production deployment
@@ -137,14 +196,18 @@ export path.
   or templates change, or repair unrelated historical tags.
 - DWI pairing now requires a recorded conversion job on every member, so sets
   whose gradients were uploaded or re-attributed outside the converting gear are
-  refused and must be reconverted or re-uploaded by that gear. Version/hash
-  binding detects a file replaced in place during an export, but cannot
+  refused pending source review and a verifiable conversion set. Version/hash
+  binding constrains a download to the selected file identity, but cannot
   reconstruct provenance the server never recorded. Nonmatching naming schemes
   require explicit source review; counts alone never authorize a pairing.
-- Derivative exclusion reads only the converter's own `ImageType`. Acquisitions
+- DWI derivative exclusion reads converter `ImageType` and `SeriesDescription`. Acquisitions
   whose converter recorded no `ImageType`, an unrecognized role, or a
   contradictory `ORIGINAL`/`DERIVED` pair are still resolved by creation time
   and may need explicit source review.
+- The export helper preserves existing roots, including study metadata. A
+  consumer wrapper that deletes its output before calling the helper bypasses
+  that protection. The Network wrapper's pre-call deletion was identified for
+  separate integration work; this fork does not change or validate that wrapper.
 - A partially QA-ignored DWI set is refused as incomplete; an entirely ignored
   set is omitted. QA flags are never cleared to make a set exportable.
 - Dry export keeps the existing placeholder-tree behavior and performs metadata

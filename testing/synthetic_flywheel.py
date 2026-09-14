@@ -33,7 +33,7 @@ class Acquisition(Obj):
     def get_file(self, name):
         return next(f for f in self.files if f.name == name)
 
-    def download_file(self, name, dest):
+    def download_file(self, name, dest, **kwargs):
         self.downloads.append(name)
         Path(dest).write_bytes(Path(self.get_file(name).source).read_bytes())
 

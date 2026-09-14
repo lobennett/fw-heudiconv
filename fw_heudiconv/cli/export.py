@@ -51,7 +51,8 @@ def file_identity(f):
     reconstructible and simply leave the download unbound.
     """
     return {key: value for key, value in (('version', get_nested(f, 'version')),
-                                          ('hash', get_nested(f, 'hash'))) if value}
+                                          ('hash', get_nested(f, 'hash')))
+            if value is not None and value != ''}
 
 
 def normalize_timing_units(d):
@@ -69,6 +70,8 @@ def normalize_timing_units(d):
     ``SliceTiming`` is already emitted in seconds by the converter and is left
     untouched. Only numeric values are touched; anything else passes through.
     """
+    if not isinstance(d, dict):
+        return d
     rt = d.get('RepetitionTime')
     if isinstance(rt, (int, float)) and not isinstance(rt, bool) and rt > 100:
         d['RepetitionTime'] = rt / 1000.0
@@ -81,7 +84,7 @@ def normalize_timing_units(d):
 def download_sidecar(d, fpath, remove_bids=True):
     d = copy.deepcopy(d)
 
-    if remove_bids and 'BIDS' in d:
+    if remove_bids and isinstance(d, dict) and 'BIDS' in d:
         if 'Task' in d['BIDS']:
             if d['BIDS']['Task'] != "":
                 d['TaskName'] = d['BIDS']['Task']
@@ -168,6 +171,7 @@ def gather_bids(client, project_label, subject_labels=None, session_labels=None)
             'name': pf.name,
             'type': 'attachment',
             'data': project_obj.id,
+            'identity': file_identity(pf),
             'BIDS': get_nested(pf, 'info', 'BIDS')
         }
         to_download['project'].append(d)
@@ -200,6 +204,7 @@ def gather_bids(client, project_label, subject_labels=None, session_labels=None)
                     'name': sf.name,
                     'type': sf.type,
                     'data': sub.id,
+                    'identity': file_identity(sf),
                     'BIDS': get_nested(sf, 'info', 'BIDS')
                 }
                 to_download['subject'].append(d)
@@ -211,6 +216,7 @@ def gather_bids(client, project_label, subject_labels=None, session_labels=None)
                     'name': sf.name,
                     'type': sf.type,
                     'data': ses.id,
+                    'identity': file_identity(sf),
                     'BIDS': get_nested(sf, 'info', 'BIDS')
                 }
                 to_download['session'].append(d)
@@ -336,11 +342,12 @@ def _validate_dwi_gradients(group, staged):
         if len(shape) not in (3, 4) or any(n < 1 for n in shape):
             raise ValueError('expected a nonempty 3D or 4D DWI image, got {}'.format(shape))
         volumes = shape[3] if len(shape) == 4 else 1
-        bvals = np.loadtxt(paths['.bval'], ndmin=2)
+        # Bvals are a vector; whitespace layout does not change its values.
+        bvals = np.asarray([float(value) for value in paths['.bval'].read_text().split()])
         bvecs = np.loadtxt(paths['.bvec'], ndmin=2)
-        if bvals.shape != (1, volumes) or bvecs.shape != (3, volumes):
+        if bvals.size != volumes or bvecs.shape != (3, volumes):
             raise ValueError('image has {} volumes; bval shape {}, bvec shape {}; '
-                             'expected (1, N) and (3, N)'.format(
+                             'expected N bvals and (3, N) bvecs'.format(
                                  volumes, bvals.shape, bvecs.shape))
         if not np.isfinite(bvals).all() or not np.isfinite(bvecs).all():
             raise ValueError('nonfinite bval or bvec values')
@@ -348,27 +355,12 @@ def _validate_dwi_gradients(group, staged):
         raise ValueError('Invalid DWI gradients for {}: {}'.format(evidence, exc)) from exc
 
 
-def _verify_file_identity(container, data):
-    """Refuse bytes from a file replaced in place since selection."""
-    selected = data.get('identity')
-    if not selected:
-        return
-    current = file_identity(container.get_file(data['name']))
-    if any(current.get(key) != value for key, value in selected.items()):
-        raise ValueError(
-            'File {} was replaced during export: selected {}, downloaded {}; recurate '
-            'and export again'.format(data['name'], selected, current))
-
-
 def download_bids(
     client, to_download, root_path,
     folders_to_download=['anat', 'dwi', 'func', 'fmap', 'perf'],
     attachments=None, dry_run=True, name='bids_dataset'
         ):
-    root = Path(root_path, name).resolve()
-    entries = _export_entries(to_download, root, folders_to_download, attachments)
-    _preflight_destinations(entries)
-    dwi_sets = list(_dwi_export_sets(entries))
+    root = Path(root_path, name)
     # An export writes one whole dataset. Merging into an existing tree would
     # silently mix it with output the current curation no longer owns, and
     # deleting that tree would destroy prior results, so refuse it untouched.
@@ -377,6 +369,10 @@ def download_bids(
             'BIDS output directory already exists: {}. Export never merges into or '
             'deletes prior output; choose an unused --destination/--directory-name.'
             .format(root))
+    root = root.resolve()
+    entries = _export_entries(to_download, root, folders_to_download, attachments)
+    _preflight_destinations(entries)
+    dwi_sets = list(_dwi_export_sets(entries))
     if dry_run:
         logger.info('Preparing output directory tree (gradient contents are not checked)...')
         root.mkdir(parents=True)
@@ -396,8 +392,10 @@ def download_bids(
                 kind, data = entry['kind'], entry['data']
                 if kind == 'file':
                     container = client.get(data['data'])
-                    container.download_file(data['name'], str(target))
-                    _verify_file_identity(container, data)
+                    # The SDK forwards these to the server's download endpoint.
+                    # A cached or refreshed metadata comparison cannot bind bytes.
+                    container.download_file(data['name'], str(target),
+                                            **(data.get('identity') or {}))
                 elif kind in ('json', 'sidecar'):
                     download_sidecar(data, str(target), remove_bids=(kind == 'sidecar'))
                 else:

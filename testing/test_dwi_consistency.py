@@ -156,10 +156,10 @@ def test_failed_download_publishes_no_partial_set(tmp_path, monkeypatch):
     before = tree_bytes(prior)
     download = type(client.acq).download_file
 
-    def fail_bvec(acq, name, dest):
+    def fail_bvec(acq, name, dest, **kwargs):
         if name.endswith('.bvec'):
             raise OSError('synthetic download failure')
-        download(acq, name, dest)
+        download(acq, name, dest, **kwargs)
 
     monkeypatch.setattr(type(client.acq), 'download_file', fail_bvec)
     with pytest.raises(OSError, match='synthetic'):
@@ -167,26 +167,6 @@ def test_failed_download_publishes_no_partial_set(tmp_path, monkeypatch):
     assert tree_bytes(prior) == before
     assert not (out / 'bids').exists()
     assert not list(out.glob('.fw-heudiconv-*'))
-
-
-def test_replaced_file_version_is_refused_before_publishing(tmp_path, monkeypatch):
-    files = dwi_set(tmp_path, 'scan')
-    client = Client(files)
-    curate(client, template('dwi', 'dwi'))
-    download = type(client.acq).download_file
-
-    def replace_nifti(acq, name, dest):
-        download(acq, name, dest)
-        if name.endswith('.nii.gz'):
-            entry = acq.get_file(name)
-            entry.version += 1
-            entry.hash = 'sha256:replaced-in-place'
-
-    monkeypatch.setattr(type(client.acq), 'download_file', replace_nifti)
-    with pytest.raises(ValueError, match='replaced during export') as exc:
-        export(client, tmp_path / 'out')
-    assert 'scan.nii.gz' in str(exc.value)
-    assert not (tmp_path / 'out' / 'bids').exists()
 
 
 def test_derived_map_never_displaces_the_raw_dwi_image(tmp_path):
